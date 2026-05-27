@@ -21,13 +21,21 @@ Caddy в Docker Compose сам выпустит HTTPS-сертификат, ко
 
 ## 2. Настройки
 
-Скопируй проект на сервер и создай `.env`:
+Скопируй проект на сервер и запусти мастер настройки:
 
 ```bash
-cp .env.example .env
+npm run setup
 ```
 
-Заполни минимум:
+Он спросит домен, Telegram token, `chat_id`, Keitaro API key, сгенерирует `WEBHOOK_TOKEN` и `POSTGRES_PASSWORD`, затем покажет готовый postback URL для Keitaro.
+
+Для быстрого non-interactive запуска:
+
+```bash
+npm run setup -- --docker --domain=bot.example.com --telegram-token=123:abc --chat-ids=123456789 --force
+```
+
+Минимум, который в итоге должен быть в `.env`:
 
 ```env
 APP_DOMAIN=bot.example.com

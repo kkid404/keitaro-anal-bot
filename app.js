@@ -42,15 +42,24 @@ async function main() {
   }
 
   const server = startWebhookServer({ config, db, bot });
+  let analyticsTimer = null;
   if (bot) {
     bot.start().catch((error) => {
       console.error(`Telegram bot stopped: ${error.message}`);
       process.exitCode = 1;
     });
+    const runAnalytics = () => {
+      bot.runScheduledAnalytics().catch((error) => {
+        console.error(`Scheduled analytics error: ${error.message}`);
+      });
+    };
+    analyticsTimer = setInterval(runAnalytics, 5 * 60 * 1000);
+    setTimeout(runAnalytics, 10000);
   }
 
   const shutdown = () => {
     console.log('Shutting down...');
+    if (analyticsTimer) clearInterval(analyticsTimer);
     bot?.stop();
     server.close(() => {
       Promise.resolve(db.close?.())

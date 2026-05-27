@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node ./app.js",
+    "setup": "node ./setup.js",
     "app": "node ./app.js",
     "bot": "node ./app.js",
     "report": "node ./index.js"

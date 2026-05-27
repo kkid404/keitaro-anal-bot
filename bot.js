@@ -52,8 +52,12 @@ const COMMANDS = `Команды:
 /done - выйти из режима поиска
 /spend [date] - расходы из загруженных FB CSV
 /accounts [date|7d|FROM TO] - эффективность рекламных аккаунтов и тренд по дням
+/roi [date] - то же, быстрый отчет по ROI
+/cpa [date] - то же, быстрый отчет по CPA
 /costs - инструкция по CSV-расходам
 /pushcosts_to IMPORT_ID CAMPAIGN_ID ROWS - вручную отправить строки costs
+/digest [date] - дневной digest по live-данным
+/alerts [date] - автоалерты по live-данным
 /settings - показать профиль бота
 /set url https://...
 /set key KEITARO_API_KEY
@@ -63,6 +67,8 @@ const COMMANDS = `Команды:
 /set cost_campaign_group kkid
 /set cost_currency USD
 /set cost_auto_push off
+/set daily_digest on
+/set auto_alerts on
 /status - статус бота`;
 
 function commandParts(text) {
@@ -108,6 +114,27 @@ function eventTime(event) {
   return event.sale_datetime || event.postback_datetime || event.created_at || '-';
 }
 
+function datePart(value) {
+  const match = clean(value).match(/^(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : '';
+}
+
+function dayLag(fromDateYmd, toDateYmd) {
+  const [fromYear, fromMonth, fromDay] = clean(fromDateYmd).split('-').map(Number);
+  const [toYear, toMonth, toDay] = clean(toDateYmd).split('-').map(Number);
+  if (!fromYear || !fromMonth || !fromDay || !toYear || !toMonth || !toDay) return 0;
+  const from = Date.UTC(fromYear, fromMonth - 1, fromDay);
+  const to = Date.UTC(toYear, toMonth - 1, toDay);
+  return Math.max(0, Math.round((to - from) / 86400000));
+}
+
+function isLateSaleEvent(event) {
+  if (clean(event.status) !== 'sale' && clean(event.previous_status) !== 'sale') return false;
+  const regDate = datePart(event.postback_datetime);
+  const saleDate = datePart(event.sale_datetime || event.postback_datetime);
+  return Boolean(regDate && saleDate && dayLag(regDate, saleDate) > 0);
+}
+
 function formatConversion(event) {
   const parsed = parseSub5(event.sub_id_5 || '');
   const lines = [
@@ -121,6 +148,19 @@ function formatConversion(event) {
   if (event.revenue) lines.push(`revenue: ${formatMoney(event.revenue)}`);
   if (event.campaign) lines.push(`campaign: ${event.campaign}`);
   return lines.join('\n');
+}
+
+function formatLateSale(event) {
+  const regDate = datePart(event.postback_datetime) || '-';
+  const saleDate = datePart(event.sale_datetime || event.postback_datetime) || '-';
+  const lag = regDate !== '-' && saleDate !== '-' ? dayLag(regDate, saleDate) : 0;
+  return [
+    'Late sale',
+    `reg date: ${regDate}`,
+    `sale date: ${saleDate}`,
+    `lag: ${lag} days`,
+    formatConversion(event),
+  ].join('\n');
 }
 
 function formatSub5SearchResult(summary, source) {
@@ -331,6 +371,7 @@ function settingsMainKeyboard() {
       ],
       [
         { text: 'Costs', callback_data: 'settings:costs' },
+        { text: 'Алерты', callback_data: 'settings:alerts' },
       ],
       [
         { text: 'В меню', callback_data: 'menu:main' },
@@ -389,6 +430,29 @@ function settingsCostsKeyboard() {
   };
 }
 
+function settingsAlertsKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'Daily digest', callback_data: 'set:daily_digest' },
+        { text: 'Автоалерты', callback_data: 'set:auto_alerts' },
+      ],
+      [
+        { text: 'Час digest', callback_data: 'set:daily_digest_hour' },
+      ],
+      [
+        { text: 'Мин. рег без депа', callback_data: 'set:alert_min_regs' },
+      ],
+      [
+        { text: 'CR drop %', callback_data: 'set:alert_cr_drop_pct' },
+      ],
+      [
+        { text: 'Назад', callback_data: 'settings:show' },
+      ],
+    ],
+  };
+}
+
 function costPushConfirmKeyboard(importId) {
   return {
     inline_keyboard: [
@@ -411,6 +475,7 @@ function settingsKeyboardForKey(key) {
   if (section === 'keitaro') return settingsKeitaroKeyboard();
   if (section === 'time') return settingsTimeKeyboard();
   if (section === 'costs') return settingsCostsKeyboard();
+  if (section === 'alerts') return settingsAlertsKeyboard();
   return settingsMainKeyboard();
 }
 
@@ -418,6 +483,24 @@ function settingsSectionForKey(key) {
   if (['url', 'key', 'timezone'].includes(key)) return 'keitaro';
   if (['update_hour', 'cabinet_timezone'].includes(key)) return 'time';
   if (['cost_campaign_ids', 'cost_campaign_group', 'cost_currency', 'cost_auto_push', 'cost_only_uniques'].includes(key)) return 'costs';
+  if ([
+    'daily_digest',
+    'daily_digest_enabled',
+    'digest',
+    'daily_digest_hour',
+    'digest_hour',
+    'auto_alerts',
+    'alerts_enabled',
+    'alerts',
+    'alert_min_regs',
+    'alert_min_regs_no_deps',
+    'min_regs_no_deps',
+    'alert_cr_drop_pct',
+    'alert_cr_drop_percent',
+    'cr_drop_pct',
+    'alert_cr_min_regs',
+    'cr_min_regs',
+  ].includes(key)) return 'alerts';
   return 'main';
 }
 
@@ -441,6 +524,7 @@ function settingsKeyboardForSection(section) {
   if (section === 'keitaro') return settingsKeitaroKeyboard();
   if (section === 'time') return settingsTimeKeyboard();
   if (section === 'costs') return settingsCostsKeyboard();
+  if (section === 'alerts') return settingsAlertsKeyboard();
   return settingsMainKeyboard();
 }
 
@@ -449,6 +533,7 @@ function sectionTitle(section) {
     keitaro: 'Настройки Keitaro',
     time: 'Время и timezone',
     costs: 'Настройки costs',
+    alerts: 'Digest и автоалерты',
   })[section] || 'Настройки';
 }
 
@@ -474,6 +559,12 @@ function settingLabel(key) {
     cost_campaign_group: 'группа кампаний',
     cost_currency: 'валюта',
     cost_auto_push: 'автоотправка costs',
+    daily_digest: 'daily digest',
+    daily_digest_hour: 'час daily digest',
+    auto_alerts: 'автоалерты',
+    alert_min_regs: 'мин. рег без депа',
+    alert_cr_drop_pct: 'CR drop %',
+    alert_cr_min_regs: 'мин. рег для CR drop',
   })[key] || key;
 }
 
@@ -488,6 +579,12 @@ function settingExample(key) {
     cost_campaign_group: 'kkid',
     cost_currency: 'USD',
     cost_auto_push: 'off',
+    daily_digest: 'on',
+    daily_digest_hour: '11',
+    auto_alerts: 'on',
+    alert_min_regs: '10',
+    alert_cr_drop_pct: '50',
+    alert_cr_min_regs: '10',
   })[key] || '';
 }
 
@@ -496,6 +593,16 @@ function parseBooleanSetting(value) {
   if (['1', 'true', 'yes', 'y', 'on', 'да', 'вкл'].includes(text)) return true;
   if (['0', 'false', 'no', 'n', 'off', 'нет', 'выкл'].includes(text)) return false;
   throw new Error('Используй on/off, yes/no или true/false.');
+}
+
+function numberSetting(value, { min = Number.NEGATIVE_INFINITY, max = Number.POSITIVE_INFINITY, integer = true } = {}) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) throw new Error('Нужно число.');
+  const normalized = integer ? Math.trunc(number) : number;
+  if (normalized < min || normalized > max) {
+    throw new Error(`Значение должно быть от ${min} до ${max}.`);
+  }
+  return normalized;
 }
 
 function decodeTelegramText(buffer) {
@@ -1125,6 +1232,145 @@ function formatBad(stats, limit = 10) {
   ].join('\n\n');
 }
 
+function median(values) {
+  const numbers = values
+    .map(Number)
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (!numbers.length) return NaN;
+  const middle = Math.floor(numbers.length / 2);
+  return numbers.length % 2
+    ? numbers[middle]
+    : (numbers[middle - 1] + numbers[middle]) / 2;
+}
+
+function buildAutoAlerts(stats, historyStats, config) {
+  const minRegsNoDeps = Math.max(1, Number(config.alertMinRegsNoDeps || 10));
+  const crMinRegs = Math.max(1, Number(config.alertCrMinRegs || minRegsNoDeps));
+  const crDropPercent = Math.min(99, Math.max(1, Number(config.alertCrDropPercent || 50)));
+  const alerts = [];
+
+  const noDepRows = stats.groups
+    .filter((row) => row.regs >= minRegsNoDeps && row.deps === 0)
+    .sort((a, b) => b.regs - a.regs || a.sub5.localeCompare(b.sub5))
+    .slice(0, 10);
+
+  if (noDepRows.length) {
+    alerts.push({
+      type: 'no_deps',
+      title: `Много рег без депа: ${noDepRows.length}`,
+      rows: noDepRows,
+      threshold: minRegsNoDeps,
+    });
+  }
+
+  const historyCr = historyStats
+    .filter((item) => Number(item.regs || 0) >= crMinRegs && Number(item.cr || 0) > 0)
+    .map((item) => Number(item.cr));
+  const medianCr = median(historyCr);
+  const currentCr = Number(stats.cr || 0);
+  const triggerCr = Number(stats.regs || 0) >= crMinRegs
+    && Number.isFinite(medianCr)
+    && medianCr > 0
+    && currentCr <= medianCr * (1 - crDropPercent / 100);
+
+  if (triggerCr) {
+    alerts.push({
+      type: 'cr_drop',
+      title: 'CR просел',
+      currentCr,
+      medianCr,
+      crDropPercent,
+      crMinRegs,
+    });
+  }
+
+  return alerts;
+}
+
+function formatAutoAlerts(dateYmd, alerts) {
+  if (!alerts.length) {
+    return [
+      `<b>Auto alerts ${escapeHtml(dateYmd)}</b>`,
+      '',
+      'Критичных сигналов не нашел.',
+    ].join('\n');
+  }
+
+  const lines = [
+    `<b>Auto alerts ${escapeHtml(dateYmd)}</b>`,
+  ];
+
+  for (const alert of alerts) {
+    lines.push('', `<b>${escapeHtml(alert.title)}</b>`);
+    if (alert.type === 'no_deps') {
+      lines.push(`Порог: <b>${alert.threshold}</b> рег без депа.`);
+      for (const [index, row] of alert.rows.entries()) {
+        lines.push(`${index + 1}. <b>${row.regs}</b> regs / 0 deps`);
+        lines.push(`<code>${escapeHtml(row.sub5)}</code>`);
+      }
+    }
+    if (alert.type === 'cr_drop') {
+      const current = formatSignedPercent(alert.currentCr * 100).replace('+', '');
+      const previous = formatSignedPercent(alert.medianCr * 100).replace('+', '');
+      lines.push(`Сейчас: <b>${escapeHtml(current)}</b>`);
+      lines.push(`Медиана прошлых дней: <b>${escapeHtml(previous)}</b>`);
+      lines.push(`Порог просадки: <b>${alert.crDropPercent}%</b>, минимум рег: <b>${alert.crMinRegs}</b>.`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function formatDailyDigest({ stats, alerts, lateRows }) {
+  const topRows = stats.groups
+    .slice()
+    .sort((a, b) => b.deps - a.deps || b.regs - a.regs || b.revenue - a.revenue)
+    .slice(0, 5);
+  const badRows = stats.groups
+    .filter((row) => row.regs > 0 && row.deps === 0)
+    .sort((a, b) => b.regs - a.regs || a.sub5.localeCompare(b.sub5))
+    .slice(0, 5);
+
+  const lines = [
+    `<b>Daily digest ${escapeHtml(stats.dateYmd)}</b>`,
+    `Regs: <b>${stats.regs}</b>`,
+    `Deps: <b>${stats.deps}</b>`,
+    `CR: <b>${escapeHtml(formatCr(stats.regs, stats.deps))}</b>`,
+    `Revenue: <b>${escapeHtml(formatMoney(stats.revenue))}</b>`,
+    `Late sales: <b>${lateRows.length}</b>`,
+  ];
+
+  if (topRows.length) {
+    lines.push('', '<b>Top sub5</b>');
+    for (const [index, row] of topRows.entries()) {
+      lines.push(`${index + 1}. ${row.deps} deps / ${row.regs} regs / CR ${escapeHtml(formatCr(row.regs, row.deps))}`);
+      lines.push(`<code>${escapeHtml(row.sub5)}</code>`);
+    }
+  }
+
+  if (badRows.length) {
+    lines.push('', '<b>Без депов</b>');
+    for (const [index, row] of badRows.entries()) {
+      lines.push(`${index + 1}. ${row.regs} regs / 0 deps`);
+      lines.push(`<code>${escapeHtml(row.sub5)}</code>`);
+    }
+  }
+
+  if (alerts.length) {
+    lines.push('', '<b>Сигналы</b>');
+    for (const alert of alerts) {
+      lines.push(`- ${escapeHtml(alert.title)}`);
+    }
+  }
+
+  if (!topRows.length && !badRows.length && !alerts.length) {
+    lines.push('', 'Live-данных за дату пока нет.');
+  }
+
+  return lines.join('\n');
+}
+
 function resolveDateArg(args, fallback = 'today') {
   const value = args.join(' ').trim() || fallback;
   return toYmd(parseRelativeDate(value));
@@ -1224,6 +1470,7 @@ export class KeitaroTelegramBot {
     this.offset = 0;
     this.running = false;
     this.chatModes = new Map();
+    this.scheduledAnalyticsRunning = false;
   }
 
   isAllowed(chatId) {
@@ -1277,10 +1524,12 @@ export class KeitaroTelegramBot {
     const chatIds = await this.notificationChatIds();
     if (!chatIds.length) return;
 
-    const text = [
-      clean(event.status) === 'sale' ? 'New sale' : 'Recovered sale',
-      formatConversion(event),
-    ].join('\n\n');
+    const text = isLateSaleEvent(event)
+      ? formatLateSale(event)
+      : [
+        clean(event.status) === 'sale' ? 'New sale' : 'Recovered sale',
+        formatConversion(event),
+      ].join('\n\n');
 
     await Promise.allSettled(chatIds.map((chatId) => this.telegram.sendMessage(chatId, text)));
   }
@@ -1310,6 +1559,29 @@ export class KeitaroTelegramBot {
       costCampaignGroup: profile.costCampaignGroup || this.config.costCampaignGroup || '',
       costAutoPush: Boolean(profile.costAutoPush ?? this.config.costAutoPush),
       costOnlyCampaignUniques: profile.costOnlyCampaignUniques ?? this.config.costOnlyCampaignUniques ?? true,
+      dailyDigestEnabled: profile.dailyDigestEnabled ?? this.config.dailyDigestEnabled ?? true,
+      dailyDigestHour: normalizeReportHour(
+        Number.isFinite(Number(profile.dailyDigestHour)) ? Number(profile.dailyDigestHour) : this.config.dailyDigestHour,
+        this.config.cabinetUpdateHour || 11,
+      ),
+      autoAlertsEnabled: profile.autoAlertsEnabled ?? this.config.autoAlertsEnabled ?? true,
+      alertMinRegsNoDeps: Number.isFinite(Number(profile.alertMinRegsNoDeps))
+        ? Number(profile.alertMinRegsNoDeps)
+        : Number.isFinite(Number(this.config.alertMinRegsNoDeps))
+          ? Number(this.config.alertMinRegsNoDeps)
+          : 10,
+      alertCrMinRegs: Number.isFinite(Number(profile.alertCrMinRegs))
+        ? Number(profile.alertCrMinRegs)
+        : Number.isFinite(Number(this.config.alertCrMinRegs))
+          ? Number(this.config.alertCrMinRegs)
+          : 10,
+      alertCrDropPercent: Number.isFinite(Number(profile.alertCrDropPercent))
+        ? Number(profile.alertCrDropPercent)
+        : Number.isFinite(Number(this.config.alertCrDropPercent))
+          ? Number(this.config.alertCrDropPercent)
+          : 50,
+      lastDailyDigestDate: profile.lastDailyDigestDate || '',
+      lastAutoAlertsDate: profile.lastAutoAlertsDate || '',
     };
   }
 
@@ -1357,8 +1629,7 @@ export class KeitaroTelegramBot {
       }
       if (mode?.type === 'stats_date') {
         this.chatModes.delete(String(chatId));
-        await this.handleStats(chatId, [message.text]);
-        await this.telegram.sendMessage(chatId, 'Live-аналитика:', { reply_markup: liveMenuKeyboard() });
+        await this.handleStats(chatId, [message.text], { reply_markup: liveMenuKeyboard() });
         return;
       }
       if (mode?.type === 'find_sub5') {
@@ -1440,6 +1711,11 @@ export class KeitaroTelegramBot {
 
       if (data === 'settings:costs') {
         await this.handleSettingsSection(chatId, 'costs', messageId);
+        return;
+      }
+
+      if (data === 'settings:alerts') {
+        await this.handleSettingsSection(chatId, 'alerts', messageId);
         return;
       }
 
@@ -1531,26 +1807,22 @@ export class KeitaroTelegramBot {
       }
 
       if (data === 'stats:today') {
-        await this.handleStats(chatId, ['today']);
-        await this.telegram.sendMessage(chatId, 'Live-аналитика:', { reply_markup: liveMenuKeyboard() });
+        await this.handleStats(chatId, ['today'], { reply_markup: liveMenuKeyboard() });
         return;
       }
 
       if (data === 'stats:yesterday') {
-        await this.handleStats(chatId, ['yesterday']);
-        await this.telegram.sendMessage(chatId, 'Live-аналитика:', { reply_markup: liveMenuKeyboard() });
+        await this.handleStats(chatId, ['yesterday'], { reply_markup: liveMenuKeyboard() });
         return;
       }
 
       if (data === 'sales:today') {
-        await this.handleSales(chatId, ['today']);
-        await this.telegram.sendMessage(chatId, 'Live-аналитика:', { reply_markup: liveMenuKeyboard() });
+        await this.handleSales(chatId, ['today'], { reply_markup: liveMenuKeyboard() });
         return;
       }
 
       if (data === 'regs:today') {
-        await this.handleRegs(chatId, ['today']);
-        await this.telegram.sendMessage(chatId, 'Live-аналитика:', { reply_markup: liveMenuKeyboard() });
+        await this.handleRegs(chatId, ['today'], { reply_markup: liveMenuKeyboard() });
         return;
       }
 
@@ -1594,20 +1866,17 @@ export class KeitaroTelegramBot {
       }
 
       if (data === 'top:today') {
-        await this.handleTop(chatId, ['today']);
-        await this.telegram.sendMessage(chatId, 'Live-аналитика:', { reply_markup: liveMenuKeyboard() });
+        await this.handleTop(chatId, ['today'], { reply_markup: liveMenuKeyboard() });
         return;
       }
 
       if (data === 'bad:today') {
-        await this.handleBad(chatId, ['today']);
-        await this.telegram.sendMessage(chatId, 'Live-аналитика:', { reply_markup: liveMenuKeyboard() });
+        await this.handleBad(chatId, ['today'], { reply_markup: liveMenuKeyboard() });
         return;
       }
 
       if (data === 'week') {
-        await this.handleWeek(chatId);
-        await this.telegram.sendMessage(chatId, 'Live-аналитика:', { reply_markup: liveMenuKeyboard() });
+        await this.handleWeek(chatId, { reply_markup: liveMenuKeyboard() });
         return;
       }
 
@@ -1678,7 +1947,15 @@ export class KeitaroTelegramBot {
       case '/accounts':
       case '/account':
       case '/accs':
+      case '/roi':
+      case '/cpa':
         await this.handleAccounts(chatId, parsed.args);
+        break;
+      case '/digest':
+        await this.handleDigest(chatId, parsed.args);
+        break;
+      case '/alerts':
+        await this.handleAlerts(chatId, parsed.args);
         break;
       case '/costs':
         await this.sendHtml(chatId, costsHelpText(), { reply_markup: spendKeyboard() });
@@ -1764,6 +2041,8 @@ export class KeitaroTelegramBot {
       `Cost fallback IDs: ${(config.costCampaignIds || []).join(', ') || 'not set'}`,
       `Cost campaign group: ${config.costCampaignGroup || 'buyer from sub_id_5'}`,
       `Cost auto push: ${config.costAutoPush ? 'on' : 'off'}`,
+      `Daily digest: ${config.dailyDigestEnabled ? `on at ${config.dailyDigestHour}:00` : 'off'}`,
+      `Auto alerts: ${config.autoAlertsEnabled ? 'on' : 'off'}`,
       `Known chats: ${chats.length}`,
       `Chat allowlist: ${(config.telegramAllowedChatIds || []).length || 'off'}`,
     ].join('\n');
@@ -1779,6 +2058,7 @@ export class KeitaroTelegramBot {
       `API key: ${maskSecret(config.keitaroApiKey)}`,
       `Время: ${config.cabinetUpdateHour}:00 ${config.cabinetTimezone}`,
       `Costs: ${config.costCurrency || 'USD'}, ${config.costAutoPush ? 'автоотправка on' : 'автоотправка off'}`,
+      `Алерты: digest ${config.dailyDigestEnabled ? 'on' : 'off'}, автоалерты ${config.autoAlertsEnabled ? 'on' : 'off'}`,
       '',
       'Выбери раздел:',
     ].join('\n');
@@ -1808,7 +2088,7 @@ export class KeitaroTelegramBot {
         `Час обновления: ${config.cabinetUpdateHour}:00 (${sourceLabel(profile.cabinetUpdateHour)})`,
         `Timezone кабинетов: ${config.cabinetTimezone} (${sourceLabel(profile.cabinetTimezone)})`,
       ];
-    } else {
+    } else if (section === 'costs') {
       lines = [
         sectionTitle(section),
         '',
@@ -1816,6 +2096,16 @@ export class KeitaroTelegramBot {
         `Группа: ${config.costCampaignGroup || 'buyer from sub_id_5'}`,
         `Автоотправка: ${config.costAutoPush ? 'on' : 'off'}`,
         `Fallback IDs: ${(config.costCampaignIds || []).join(', ') || 'not set'}`,
+      ];
+    } else {
+      lines = [
+        sectionTitle(section),
+        '',
+        `Daily digest: ${config.dailyDigestEnabled ? 'on' : 'off'}`,
+        `Час digest: ${config.dailyDigestHour}:00 ${config.cabinetTimezone}`,
+        `Автоалерты: ${config.autoAlertsEnabled ? 'on' : 'off'}`,
+        `Мин. рег без депа: ${config.alertMinRegsNoDeps}`,
+        `CR drop: ${config.alertCrDropPercent}% при минимум ${config.alertCrMinRegs} регах`,
       ];
     }
 
@@ -1852,6 +2142,18 @@ export class KeitaroTelegramBot {
       patch.costAutoPush = parseBooleanSetting(value);
     } else if (['cost_only_uniques', 'only_campaign_uniques'].includes(key)) {
       patch.costOnlyCampaignUniques = parseBooleanSetting(value);
+    } else if (['daily_digest', 'daily_digest_enabled', 'digest'].includes(key)) {
+      patch.dailyDigestEnabled = parseBooleanSetting(value);
+    } else if (['daily_digest_hour', 'digest_hour'].includes(key)) {
+      patch.dailyDigestHour = numberSetting(value, { min: 0, max: 23 });
+    } else if (['auto_alerts', 'alerts_enabled', 'alerts'].includes(key)) {
+      patch.autoAlertsEnabled = parseBooleanSetting(value);
+    } else if (['alert_min_regs', 'alert_min_regs_no_deps', 'min_regs_no_deps'].includes(key)) {
+      patch.alertMinRegsNoDeps = numberSetting(value, { min: 1, max: 10000 });
+    } else if (['alert_cr_drop_pct', 'alert_cr_drop_percent', 'cr_drop_pct'].includes(key)) {
+      patch.alertCrDropPercent = numberSetting(value, { min: 1, max: 99 });
+    } else if (['alert_cr_min_regs', 'cr_min_regs'].includes(key)) {
+      patch.alertCrMinRegs = numberSetting(value, { min: 1, max: 10000 });
     } else {
       throw new Error(`Неизвестная настройка: ${key}`);
     }
@@ -1889,6 +2191,9 @@ export class KeitaroTelegramBot {
         '/set cost_campaign_group kkid',
         '/set cost_currency USD',
         '/set cost_auto_push off',
+        '/set daily_digest on',
+        '/set auto_alerts on',
+        '/set alert_min_regs 10',
       ].join('\n'));
       return;
     }
@@ -2338,11 +2643,11 @@ export class KeitaroTelegramBot {
     }
   }
 
-  async handleStats(chatId, args) {
+  async handleStats(chatId, args, options = {}) {
     const dateYmd = resolveDateArg(args, 'today');
     const stats = await this.db.statsForDate(dateYmd);
     const config = await this.profileConfig();
-    await this.telegram.sendMessage(chatId, formatStats(stats) + cabinetFreshnessNote(config, dateYmd));
+    await this.telegram.sendMessage(chatId, formatStats(stats) + cabinetFreshnessNote(config, dateYmd), options);
   }
 
   async handleLast(chatId, args) {
@@ -2356,18 +2661,18 @@ export class KeitaroTelegramBot {
     await this.telegram.sendMessage(chatId, rows.map(formatConversion).join('\n\n'));
   }
 
-  async handleSales(chatId, args) {
+  async handleSales(chatId, args, options = {}) {
     const dateYmd = resolveDateArg(args, 'today');
     const rows = await this.db.listConversions({ status: 'sale', dateYmd, limit: 30 });
     if (!rows.length) {
-      await this.telegram.sendMessage(chatId, `Live-продаж за ${dateYmd} пока нет.`);
+      await this.telegram.sendMessage(chatId, `Live-продаж за ${dateYmd} пока нет.`, options);
       return;
     }
     const config = await this.profileConfig();
-    await this.telegram.sendMessage(chatId, rows.map(formatConversion).join('\n\n') + cabinetFreshnessNote(config, dateYmd));
+    await this.telegram.sendMessage(chatId, rows.map(formatConversion).join('\n\n') + cabinetFreshnessNote(config, dateYmd), options);
   }
 
-  async handleRegs(chatId, args) {
+  async handleRegs(chatId, args, options = {}) {
     const dateYmd = resolveDateArg(args, 'today');
     const rows = (await this.db.listConversions({ limit: 500 }))
       .filter((event) => ['lead', 'sale'].includes(clean(event.status)))
@@ -2375,52 +2680,130 @@ export class KeitaroTelegramBot {
       .slice(0, 30);
 
     if (!rows.length) {
-      await this.telegram.sendMessage(chatId, `Live-рег за ${dateYmd} пока нет.`);
+      await this.telegram.sendMessage(chatId, `Live-рег за ${dateYmd} пока нет.`, options);
       return;
     }
     const config = await this.profileConfig();
-    await this.telegram.sendMessage(chatId, rows.map(formatConversion).join('\n\n') + cabinetFreshnessNote(config, dateYmd));
+    await this.telegram.sendMessage(chatId, rows.map(formatConversion).join('\n\n') + cabinetFreshnessNote(config, dateYmd), options);
   }
 
-  async handleTop(chatId, args) {
+  async handleTop(chatId, args, options = {}) {
     const dateYmd = resolveDateArg(args, 'today');
     const stats = await this.db.statsForDate(dateYmd);
     const config = await this.profileConfig();
-    await this.telegram.sendMessage(chatId, formatTop(stats) + cabinetFreshnessNote(config, dateYmd));
+    await this.telegram.sendMessage(chatId, formatTop(stats) + cabinetFreshnessNote(config, dateYmd), options);
   }
 
-  async handleBad(chatId, args) {
+  async handleBad(chatId, args, options = {}) {
     const dateYmd = resolveDateArg(args, 'today');
     const stats = await this.db.statsForDate(dateYmd);
     const config = await this.profileConfig();
-    await this.telegram.sendMessage(chatId, formatBad(stats) + cabinetFreshnessNote(config, dateYmd));
+    await this.telegram.sendMessage(chatId, formatBad(stats) + cabinetFreshnessNote(config, dateYmd), options);
   }
 
-  async handleLate(chatId, args) {
+  async handleLate(chatId, args, options = {}) {
     const dateYmd = resolveDateArg(args, 'today');
     const rows = (await this.db.listConversions({ status: 'sale', dateYmd, limit: 100 }))
       .filter((event) => !startsWithDate(event.postback_datetime, dateYmd))
       .slice(0, 30);
 
     if (!rows.length) {
-      await this.telegram.sendMessage(chatId, `Late sales за ${dateYmd} не найдено.`);
+      await this.telegram.sendMessage(chatId, `Late sales за ${dateYmd} не найдено.`, options);
       return;
     }
     const config = await this.profileConfig();
     await this.telegram.sendMessage(chatId, [
       `Late sales ${dateYmd}`,
       ...rows.map(formatConversion),
-    ].join('\n\n') + cabinetFreshnessNote(config, dateYmd));
+    ].join('\n\n') + cabinetFreshnessNote(config, dateYmd), options);
   }
 
-  async handleWeek(chatId) {
+  async handleWeek(chatId, options = {}) {
     const lines = ['Live week'];
     for (let index = 0; index < 7; index += 1) {
       const dateYmd = ymdOffset(index);
       const stats = await this.db.statsForDate(dateYmd);
       lines.push(`${dateYmd}: ${stats.regs} regs / ${stats.deps} deps / CR ${formatCr(stats.regs, stats.deps)} / rev ${formatMoney(stats.revenue)}`);
     }
-    await this.telegram.sendMessage(chatId, lines.join('\n'));
+    await this.telegram.sendMessage(chatId, lines.join('\n'), options);
+  }
+
+  async digestData(dateYmd, config = null) {
+    const effectiveConfig = config || await this.profileConfig();
+    const [stats, lateRows, ...historyStats] = await Promise.all([
+      this.db.statsForDate(dateYmd),
+      this.db.listConversions({ status: 'sale', dateYmd, limit: 100 })
+        .then((rows) => rows.filter(isLateSaleEvent)),
+      ...Array.from({ length: 7 }, (_, index) => this.db.statsForDate(shiftYmd(dateYmd, -(index + 1)))),
+    ]);
+    const alerts = buildAutoAlerts(stats, historyStats, effectiveConfig);
+    return { stats, lateRows, historyStats, alerts };
+  }
+
+  async handleDigest(chatId, args) {
+    const config = await this.profileConfig();
+    const dateYmd = resolveDateArg(args, shiftYmd(localDateParts(config.cabinetTimezone || config.keitaroTimezone).ymd, -1));
+    const digest = await this.digestData(dateYmd, config);
+    await this.sendHtml(chatId, formatDailyDigest(digest), { reply_markup: liveMenuKeyboard() });
+  }
+
+  async handleAlerts(chatId, args) {
+    const config = await this.profileConfig();
+    const dateYmd = resolveDateArg(args, shiftYmd(localDateParts(config.cabinetTimezone || config.keitaroTimezone).ymd, -1));
+    const digest = await this.digestData(dateYmd, config);
+    await this.sendHtml(chatId, formatAutoAlerts(dateYmd, digest.alerts), { reply_markup: liveMenuKeyboard() });
+  }
+
+  async runScheduledAnalytics(now = new Date()) {
+    if (this.scheduledAnalyticsRunning) return;
+    this.scheduledAnalyticsRunning = true;
+    try {
+      const config = await this.profileConfig();
+      const timeZone = config.cabinetTimezone || config.keitaroTimezone || 'Asia/Tbilisi';
+      const local = localDateParts(timeZone, now);
+      const digestHour = normalizeReportHour(config.dailyDigestHour, config.cabinetUpdateHour || 11);
+      if (local.hour < digestHour) return;
+
+      const dateYmd = shiftYmd(local.ymd, -1);
+      const shouldSendDigest = config.dailyDigestEnabled !== false
+        && config.lastDailyDigestDate !== dateYmd;
+      const shouldSendAlerts = config.autoAlertsEnabled !== false
+        && config.lastAutoAlertsDate !== dateYmd;
+      if (!shouldSendDigest && !shouldSendAlerts) return;
+
+      const chatIds = await this.notificationChatIds();
+      if (!chatIds.length) return;
+
+      const digest = await this.digestData(dateYmd, config);
+      const patch = {};
+
+      if (shouldSendDigest) {
+        const text = formatDailyDigest(digest);
+        const results = await Promise.allSettled(chatIds.map((chatId) => this.sendHtml(chatId, text)));
+        if (results.some((result) => result.status === 'fulfilled')) {
+          patch.lastDailyDigestDate = dateYmd;
+        }
+      }
+
+      if (shouldSendAlerts) {
+        const text = formatAutoAlerts(dateYmd, digest.alerts);
+        const shouldActuallySend = digest.alerts.length > 0 || !shouldSendDigest;
+        if (shouldActuallySend) {
+          const results = await Promise.allSettled(chatIds.map((chatId) => this.sendHtml(chatId, text)));
+          if (results.some((result) => result.status === 'fulfilled')) {
+            patch.lastAutoAlertsDate = dateYmd;
+          }
+        } else {
+          patch.lastAutoAlertsDate = dateYmd;
+        }
+      }
+
+      if (Object.keys(patch).length) {
+        await this.db.updateProfile(patch);
+      }
+    } finally {
+      this.scheduledAnalyticsRunning = false;
+    }
   }
 
   async handleSub5(chatId, sub5) {

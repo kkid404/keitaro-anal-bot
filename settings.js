@@ -34,6 +34,7 @@ function envBool(name, fallback = false) {
 }
 
 export function readConfig() {
+  const cabinetUpdateHour = Number(process.env.CABINET_UPDATE_HOUR || 11);
   return {
     keitaroBaseUrl: process.env.KEITARO_BASE_URL || 'https://ibrkeit.xyz',
     keitaroApiKey: process.env.KEITARO_API_KEY || '',
@@ -49,7 +50,7 @@ export function readConfig() {
     databaseUrl: process.env.DATABASE_URL || '',
     databaseSsl: envBool('DATABASE_SSL', false),
     apiLimit: Number(process.env.KEITARO_API_LIMIT || 1000),
-    cabinetUpdateHour: Number(process.env.CABINET_UPDATE_HOUR || 11),
+    cabinetUpdateHour,
     cabinetTimezone: process.env.CABINET_TIMEZONE || process.env.KEITARO_TIMEZONE || 'Asia/Tbilisi',
     costCampaignIds: (process.env.KEITARO_COST_CAMPAIGN_IDS || '')
       .split(',')
@@ -59,5 +60,11 @@ export function readConfig() {
     costCampaignGroup: process.env.COST_CAMPAIGN_GROUP || '',
     costAutoPush: envBool('COST_AUTO_PUSH', false),
     costOnlyCampaignUniques: !['0', 'false', 'no', 'off'].includes((process.env.COST_ONLY_CAMPAIGN_UNIQUES || '').toLowerCase()),
+    dailyDigestEnabled: envBool('DAILY_DIGEST_ENABLED', true),
+    dailyDigestHour: Number(process.env.DAILY_DIGEST_HOUR || cabinetUpdateHour),
+    autoAlertsEnabled: envBool('AUTO_ALERTS_ENABLED', true),
+    alertMinRegsNoDeps: Number(process.env.ALERT_MIN_REGS_NO_DEPS || 10),
+    alertCrMinRegs: Number(process.env.ALERT_CR_MIN_REGS || 10),
+    alertCrDropPercent: Number(process.env.ALERT_CR_DROP_PERCENT || 50),
   };
 }

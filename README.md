@@ -13,7 +13,19 @@ Node.js сервис для баера:
 
 ## Настройка
 
-Создай `.env` рядом с `app.js` по примеру `.env.example`:
+Самый быстрый путь - запустить мастер настройки:
+
+```bash
+npm run setup
+```
+
+Он соберет `.env`, сгенерирует `WEBHOOK_TOKEN` и `POSTGRES_PASSWORD`, подскажет webhook URL для Keitaro и команды запуска. Для автоматического запуска на сервере можно передать параметры:
+
+```bash
+npm run setup -- --docker --domain=bot.example.com --telegram-token=123:abc --chat-ids=123456789 --force
+```
+
+Вручную `.env` можно создать рядом с `app.js` по примеру `.env.example`:
 
 ```env
 KEITARO_BASE_URL=https://ibrkeit.xyz
@@ -27,6 +39,12 @@ COST_CURRENCY=USD
 COST_CAMPAIGN_GROUP=
 COST_AUTO_PUSH=false
 COST_ONLY_CAMPAIGN_UNIQUES=true
+DAILY_DIGEST_ENABLED=true
+DAILY_DIGEST_HOUR=11
+AUTO_ALERTS_ENABLED=true
+ALERT_MIN_REGS_NO_DEPS=10
+ALERT_CR_MIN_REGS=10
+ALERT_CR_DROP_PERCENT=50
 
 TELEGRAM_BOT_TOKEN=your-telegram-bot-token
 TELEGRAM_ALLOWED_CHAT_IDS=123456789
@@ -80,7 +98,8 @@ node .\app.js
 
 - Telegram long polling;
 - HTTP server на `WEBHOOK_PORT`;
-- локальное хранилище в `DATA_DIR`.
+- локальное хранилище в `DATA_DIR`;
+- in-process планировщик daily digest и автоалертов.
 
 ## Telegram-команды
 
@@ -90,7 +109,7 @@ node .\app.js
 - `Live` - статистика, продажи, реги, топ sub5 и sub5 без депов;
 - `Расходы` - spend из Facebook CSV, инструкция загрузки и costs;
 - `Поиск` - режим поиска по одному или нескольким `sub5`;
-- `Настройки` - группы настроек Keitaro, времени и costs;
+- `Настройки` - группы настроек Keitaro, времени, costs и алертов;
 - `Помощь` - короткая справка.
 
 В настройках сначала выбери группу, например `Keitaro` или `Costs`, затем нажми нужную настройку и пришли значение следующим сообщением.
@@ -109,6 +128,9 @@ node .\app.js
 - `/set cost_currency USD` - валюта расходов из FB CSV.
 - `/set cost_campaign_group kkid` - точная группа кампаний Keitaro для auto-push costs. Если не задано, бот берет buyer из `sub_id_5`, например `kkid`.
 - `/set cost_auto_push off` - автоотправка costs в Keitaro после загрузки CSV.
+- `/set daily_digest on` - ежедневный digest за вчера после `DAILY_DIGEST_HOUR`.
+- `/set auto_alerts on` - автоалерты по live-данным.
+- `/set alert_min_regs 10` - порог для алерта "реги без депа".
 - `/report 2026-05-26` - CSV из Keitaro API. Перед генерацией бот спросит, считать с 11:00 или с 00:00 по времени Keitaro.
 - `/offers 2026-05-26` - CSV по офферам в формате `Оффер, Выплата, Количество, Общий доход`. Перед генерацией бот спросит, считать с 11:00 или с 00:00 по времени Keitaro.
 - `/today` - CSV за сегодня.
@@ -117,6 +139,9 @@ node .\app.js
 - `/spend [date]` - расходы из загруженных Facebook CSV.
 - `/accounts [date]` - эффективность рекламных аккаунтов: spend, revenue, profit, ROI, CPA, CPL и CR по каждому account id из `sub_id_5`.
 - `/accounts 7d` или `/accounts 2026-05-20 2026-05-26` - тренд по аккаунтам в разрезе дней; проблемные аккаунты сортируются сверху.
+- `/roi [date]` и `/cpa [date]` - быстрые алиасы к отчету `/accounts`.
+- `/digest [date]` - дневной digest по live-данным.
+- `/alerts [date]` - проверить автоалерты вручную.
 - `/costs` - инструкция по загрузке CSV-расходов.
 - `/pushcosts IMPORT_ID` - отправить конкретный импорт расходов в Keitaro.
 - `/pushcosts_to IMPORT_ID CAMPAIGN_ID 2,4,7` - вручную отправить выбранные строки импорта в указанную кампанию.
