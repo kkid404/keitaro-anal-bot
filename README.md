@@ -1,11 +1,10 @@
 # Keitaro dashboard bot
 
-This bot now lives inside the main `keitaro-mcp` workspace under `bot/`.
-Run it from the repository root with `.\run-keitaro-bot.ps1`, or from this
-folder with `npm run app`.
+This repository contains the Telegram bot and the standalone kill/scale dashboard.
+Run the bot with `npm run app`. The dashboard lives in `dashboard/`.
 
-It reads `bot/.env` first and then the root `.env` as a shared fallback.
-For Docker, use the root `docker-compose.yml` from `keitaro-mcp`.
+Both services read the same root `.env` file. Docker Compose starts the dashboard,
+bot, PostgreSQL, and optional Caddy proxy from this repository.
 
 The original standalone project name was `keitaro-sub5-report`.
 
@@ -26,6 +25,21 @@ Node.js сервис для баера:
 
 ```bash
 npm run setup
+```
+
+## Dashboard
+
+The dashboard is a separate Python service in `dashboard/`. With Docker Compose it is
+available at:
+
+```text
+http://127.0.0.1:8765
+```
+
+The bot webhook healthcheck remains:
+
+```text
+http://127.0.0.1:3000/health
 ```
 
 Он соберет `.env`, сгенерирует `WEBHOOK_TOKEN` и `POSTGRES_PASSWORD`, подскажет webhook URL для Keitaro и команды запуска. Для автоматического запуска на сервере можно передать параметры:

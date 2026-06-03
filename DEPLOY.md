@@ -1,8 +1,8 @@
 # Быстрый деплой на сервер
 
-## В составе общего проекта
+## Dashboard + bot
 
-Из корня `keitaro-mcp` теперь можно поднять bot + dashboard + PostgreSQL одной командой:
+Из корня этого репозитория можно поднять bot + dashboard + PostgreSQL одной командой:
 
 ```bash
 cp .env.example .env
@@ -22,7 +22,7 @@ http://127.0.0.1:3000/health
 docker compose --profile proxy up -d --build
 ```
 
-Перед этим задай `APP_DOMAIN` в корневом `.env`.
+Перед этим задай `APP_DOMAIN` в `.env`.
 
 ## 1. Домен
 

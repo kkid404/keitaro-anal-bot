@@ -1,5 +1,6 @@
 data/
 node_modules/
+dashboard/
 npm-debug.log*
 .env
 .env.*

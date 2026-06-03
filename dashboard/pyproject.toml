@@ -1,0 +1,16 @@
+[project]
+name = "keitaro-dashboard"
+version = "0.1.0"
+description = "Standalone kill/scale dashboard storage for Keitaro and spend facts"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+keitaro-dashboard = "keitaro_dashboard.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

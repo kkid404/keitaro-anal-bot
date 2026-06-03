@@ -1,4 +1,25 @@
 services:
+  dashboard:
+    build:
+      context: ./dashboard
+    restart: unless-stopped
+    environment:
+      KEITARO_URL: ${KEITARO_URL:-}
+      KEITARO_BASE_URL: ${KEITARO_BASE_URL:-}
+      KEITARO_API_KEY: ${KEITARO_API_KEY:-}
+      KEITARO_TIMEZONE: ${KEITARO_TIMEZONE:-Asia/Yerevan}
+      KEITARO_DASHBOARD_DB: /data/keitaro-dashboard.sqlite3
+      CABINET_UPDATE_HOUR: ${CABINET_UPDATE_HOUR:-11}
+      KEITARO_COST_CAMPAIGN_IDS: ${KEITARO_COST_CAMPAIGN_IDS:-}
+      COST_CURRENCY: ${COST_CURRENCY:-USD}
+      COST_CAMPAIGN_GROUP: ${COST_CAMPAIGN_GROUP:-}
+      COST_AUTO_PUSH: ${COST_AUTO_PUSH:-false}
+      COST_ONLY_CAMPAIGN_UNIQUES: ${COST_ONLY_CAMPAIGN_UNIQUES:-true}
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8765}:8765"
+    volumes:
+      - dashboard_data:/data
+
   app:
     build: .
     restart: unless-stopped
@@ -47,6 +68,7 @@ services:
       retries: 20
 
 volumes:
+  dashboard_data:
   postgres_data:
   caddy_data:
   caddy_config:

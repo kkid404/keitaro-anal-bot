@@ -2,3 +2,8 @@
 *.csv
 data/
 node_modules/
+__pycache__/
+*.pyc
+dashboard/data/
+dashboard/.venv/
+dashboard/.pytest_cache/
