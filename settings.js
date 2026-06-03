@@ -36,7 +36,7 @@ function envBool(name, fallback = false) {
 export function readConfig() {
   const cabinetUpdateHour = Number(process.env.CABINET_UPDATE_HOUR || 11);
   return {
-    keitaroBaseUrl: process.env.KEITARO_BASE_URL || 'https://ibrkeit.xyz',
+    keitaroBaseUrl: process.env.KEITARO_BASE_URL || process.env.KEITARO_URL || 'https://ibrkeit.xyz',
     keitaroApiKey: process.env.KEITARO_API_KEY || '',
     keitaroTimezone: process.env.KEITARO_TIMEZONE || 'Asia/Yerevan',
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
@@ -60,6 +60,12 @@ export function readConfig() {
     costCampaignGroup: process.env.COST_CAMPAIGN_GROUP || '',
     costAutoPush: envBool('COST_AUTO_PUSH', false),
     costOnlyCampaignUniques: !['0', 'false', 'no', 'off'].includes((process.env.COST_ONLY_CAMPAIGN_UNIQUES || '').toLowerCase()),
+    openaiApiKey: process.env.OPENAI_API_KEY || '',
+    openaiBaseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+    openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+    gptCostRoutingEnabled: envBool('GPT_COST_ROUTING_ENABLED', true),
+    gptCostRoutingMinConfidence: Number(process.env.GPT_COST_ROUTING_MIN_CONFIDENCE || 0.85),
+    gptCostRoutingCandidateLimit: Number(process.env.GPT_COST_ROUTING_CANDIDATE_LIMIT || 40),
     dailyDigestEnabled: envBool('DAILY_DIGEST_ENABLED', true),
     dailyDigestHour: Number(process.env.DAILY_DIGEST_HOUR || cabinetUpdateHour),
     autoAlertsEnabled: envBool('AUTO_ALERTS_ENABLED', true),

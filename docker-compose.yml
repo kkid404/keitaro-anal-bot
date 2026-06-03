@@ -19,6 +19,7 @@ services:
     restart: unless-stopped
     environment:
       APP_DOMAIN: ${APP_DOMAIN:-localhost}
+      BOT_UPSTREAM: app
       WEBHOOK_PORT: ${WEBHOOK_PORT:-3000}
     ports:
       - "80:80"

@@ -96,6 +96,7 @@ Options:
 
 async function main() {
   await loadDotEnv(path.join(scriptDir, '.env'));
+  await loadDotEnv(path.join(scriptDir, '..', '.env'));
 
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {

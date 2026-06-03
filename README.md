@@ -1,4 +1,13 @@
-# Keitaro sub5 report bot
+# Keitaro dashboard bot
+
+This bot now lives inside the main `keitaro-mcp` workspace under `bot/`.
+Run it from the repository root with `.\run-keitaro-bot.ps1`, or from this
+folder with `npm run app`.
+
+It reads `bot/.env` first and then the root `.env` as a shared fallback.
+For Docker, use the root `docker-compose.yml` from `keitaro-mcp`.
+
+The original standalone project name was `keitaro-sub5-report`.
 
 Node.js сервис для баера:
 
@@ -128,11 +137,15 @@ node .\app.js
 - `/set cost_currency USD` - валюта расходов из FB CSV.
 - `/set cost_campaign_group kkid` - точная группа кампаний Keitaro для auto-push costs. Если не задано, бот берет buyer из `sub_id_5`, например `kkid`.
 - `/set cost_auto_push off` - автоотправка costs в Keitaro после загрузки CSV.
+- `/set openai_key sk-...` - OpenAI API key для GPT fallback в costs routing.
+- `/set gpt_cost_routing on` - включить GPT fallback, когда обычный поиск не нашел campaign_id.
+- `/set gpt_cost_confidence 0.85` - минимальная уверенность GPT для auto-route.
 - `/set daily_digest on` - ежедневный digest за вчера после `DAILY_DIGEST_HOUR`.
 - `/set auto_alerts on` - автоалерты по live-данным.
 - `/set alert_min_regs 10` - порог для алерта "реги без депа".
 - `/report 2026-05-26` - CSV из Keitaro API. Перед генерацией бот спросит, считать с 11:00 или с 00:00 по времени Keitaro.
 - `/offers 2026-05-26` - CSV по офферам в формате `Оффер, Выплата, Количество, Общий доход`. Перед генерацией бот спросит, считать с 11:00 или с 00:00 по времени Keitaro.
+- `/offers суббота`, `/offers позавчера` или `/offers 2d` - быстрый отчет по офферам за нужный прошедший день, например в понедельник за субботу.
 - `/today` - CSV за сегодня.
 - `/yesterday` - CSV за вчера.
 - `/stats [date]` - live-статистика из webhook-журнала.
@@ -210,11 +223,12 @@ source: Keitaro API
    2505|ZM|kkid|1460255925848277|YU_ZM24|1-1-2|cbo|2
    ```
 
-4. Отправь CSV-файл прямо в Telegram-бота.
+4. Отправь один CSV-файл или несколько CSV-файлов одним сообщением прямо в Telegram-бота.
 
 Бот:
 
-- распарсит расходы;
+- распарсит расходы из всех присланных CSV;
+- объединит несколько CSV в один импорт;
 - сгруппирует их по `account_id` из `sub_id_5` и самому `sub_id_5`;
 - сохранит локально в `data/facebook_spend.jsonl`;
 - покажет `/spend today`;
@@ -231,7 +245,7 @@ Campaign IDs вводить не нужно. При отправке costs бо�
 Если один `sub_id_5` найден в нескольких группах кампаний, бот выбирает только точную группу из настройки `cost_campaign_group`, а если она не задана - buyer из `sub_id_5`, например `kkid`. Группа вроде `kkid Для копий` не будет выбрана для auto-push `kkid`.
 Дата из FB CSV отправляется в Keitaro как баерское окно от `CABINET_UPDATE_HOUR` до следующего такого часа. Например при `CABINET_UPDATE_HOUR=11` расход FB за `2026-05-26` уйдет в период `2026-05-26 11:00:00` - `2026-05-27 10:59:59` по timezone Keitaro.
 
-После загрузки CSV можно нажать кнопку `Отправить costs в Keitaro`, подтвердить отправку или выполнить:
+После загрузки CSV или пачки CSV можно нажать кнопку `Отправить costs в Keitaro`, подтвердить отправку или выполнить:
 
 ```text
 /pushcosts IMPORT_ID

@@ -1,4 +1,5 @@
 import {
+  combineFacebookSpendImports,
   parseCampaignIds,
   parseFacebookSpendCsv,
   pushFacebookCostsToKeitaro,
@@ -22,6 +23,8 @@ import {
 } from './report.js';
 import { TelegramClient } from './telegram.js';
 
+const DOCUMENT_GROUP_COLLECT_MS = 2000;
+
 const HELP = `Бот помогает баеру:
 
 1. Строить отчеты sub5 и офферов из Keitaro.
@@ -36,6 +39,7 @@ const HELP = `Бот помогает баеру:
 const COMMANDS = `Команды:
 /report 2026-05-26 - CSV по sub5 из Keitaro API
 /offers 2026-05-26 - CSV по офферам: Оффер, Выплата, Количество, Общий доход
+/offers суббота - CSV по офферам за ближайшую прошедшую субботу
 /today - отчет за сегодня
 /yesterday - отчет за вчера
 /stats [date] - live-статистика из webhook-журнала
@@ -106,6 +110,12 @@ function formatMoney(value) {
   return Number(value || 0).toFixed(2);
 }
 
+function formatOptionalCount(value) {
+  if (value === null || value === undefined) return '-';
+  const count = Number(value);
+  return Number.isFinite(count) ? String(count) : '-';
+}
+
 function formatCr(regs, deps) {
   return regs ? `${((deps / regs) * 100).toFixed(1)}%` : '0.0%';
 }
@@ -171,6 +181,7 @@ function formatSub5SearchResult(summary, source) {
     `<b>Найдено${summary.dateYmd ? ` за ${escapeHtml(summary.dateYmd)}` : ''}</b>`,
     `Реги: <b>${summary.regs}</b>`,
     `Депы: <b>${summary.deps}</b>`,
+    `Installs: <b>${escapeHtml(formatOptionalCount(summary.installs))}</b>`,
     `Revenue: <b>${escapeHtml(formatMoney(summary.revenue))}</b>`,
   ];
 
@@ -230,7 +241,12 @@ function reportKeyboard() {
         { text: 'Офферы вчера', callback_data: 'offers:yesterday' },
       ],
       [
-        { text: 'Другая дата', callback_data: 'menu:report_dates' },
+        { text: 'Sub5 позавчера', callback_data: 'report:2d' },
+        { text: 'Офферы позавчера', callback_data: 'offers:2d' },
+      ],
+      [
+        { text: 'Sub5 другая дата', callback_data: 'mode:report_date' },
+        { text: 'Офферы дата', callback_data: 'mode:offer_date' },
       ],
       [
         { text: 'В меню', callback_data: 'menu:main' },
@@ -424,6 +440,14 @@ function settingsCostsKeyboard() {
         { text: 'Автоотправка', callback_data: 'set:cost_auto_push' },
       ],
       [
+        { text: 'GPT costs', callback_data: 'set:gpt_cost_routing' },
+        { text: 'OpenAI key', callback_data: 'set:openai_key' },
+      ],
+      [
+        { text: 'GPT model', callback_data: 'set:openai_model' },
+        { text: 'GPT confidence', callback_data: 'set:gpt_cost_confidence' },
+      ],
+      [
         { text: 'Назад', callback_data: 'settings:show' },
       ],
     ],
@@ -482,7 +506,18 @@ function settingsKeyboardForKey(key) {
 function settingsSectionForKey(key) {
   if (['url', 'key', 'timezone'].includes(key)) return 'keitaro';
   if (['update_hour', 'cabinet_timezone'].includes(key)) return 'time';
-  if (['cost_campaign_ids', 'cost_campaign_group', 'cost_currency', 'cost_auto_push', 'cost_only_uniques'].includes(key)) return 'costs';
+  if ([
+    'cost_campaign_ids',
+    'cost_campaign_group',
+    'cost_currency',
+    'cost_auto_push',
+    'cost_only_uniques',
+    'openai_key',
+    'openai_model',
+    'gpt_cost_routing',
+    'gpt_cost_confidence',
+    'gpt_cost_candidate_limit',
+  ].includes(key)) return 'costs';
   if ([
     'daily_digest',
     'daily_digest_enabled',
@@ -559,6 +594,11 @@ function settingLabel(key) {
     cost_campaign_group: 'группа кампаний',
     cost_currency: 'валюта',
     cost_auto_push: 'автоотправка costs',
+    openai_key: 'OpenAI API key',
+    openai_model: 'OpenAI model',
+    gpt_cost_routing: 'GPT fallback для costs',
+    gpt_cost_confidence: 'GPT confidence для costs',
+    gpt_cost_candidate_limit: 'GPT candidate limit',
     daily_digest: 'daily digest',
     daily_digest_hour: 'час daily digest',
     auto_alerts: 'автоалерты',
@@ -579,6 +619,11 @@ function settingExample(key) {
     cost_campaign_group: 'kkid',
     cost_currency: 'USD',
     cost_auto_push: 'off',
+    openai_key: 'sk-...',
+    openai_model: 'gpt-4o-mini',
+    gpt_cost_routing: 'on',
+    gpt_cost_confidence: '0.85',
+    gpt_cost_candidate_limit: '40',
     daily_digest: 'on',
     daily_digest_hour: '11',
     auto_alerts: 'on',
@@ -773,6 +818,7 @@ function buildAccountPerformance(report, spendStats) {
     const key = clean(accountId || 'unknown') || 'unknown';
     const current = rowsByAccount.get(key) || {
       accountId: key,
+      installs: 0,
       regs: 0,
       deps: 0,
       revenue: 0,
@@ -786,6 +832,7 @@ function buildAccountPerformance(report, spendStats) {
 
   for (const row of report.rows || []) {
     const item = ensureRow(row.accountId);
+    item.installs += Number(row.installs || 0);
     item.regs += Number(row.regs || 0);
     item.deps += Number(row.deps || 0);
     item.revenue += Number(row.revenue || 0);
@@ -799,7 +846,7 @@ function buildAccountPerformance(report, spendStats) {
   }
 
   const rows = [...rowsByAccount.values()]
-    .filter((row) => row.spend || row.regs || row.deps || row.revenue)
+    .filter((row) => row.spend || row.installs || row.regs || row.deps || row.revenue)
     .map((row) => {
       const profit = row.revenue - row.spend;
       return {
@@ -821,6 +868,7 @@ function buildAccountPerformance(report, spendStats) {
     acc.spend += row.spend;
     acc.revenue += row.revenue;
     acc.profit += row.profit;
+    acc.installs += row.installs;
     acc.regs += row.regs;
     acc.deps += row.deps;
     acc.fbResults += row.fbResults;
@@ -830,6 +878,7 @@ function buildAccountPerformance(report, spendStats) {
     spend: 0,
     revenue: 0,
     profit: 0,
+    installs: 0,
     regs: 0,
     deps: 0,
     fbResults: 0,
@@ -839,7 +888,7 @@ function buildAccountPerformance(report, spendStats) {
   totals.roi = totals.spend > 0 ? (totals.profit / totals.spend) * 100 : NaN;
   totals.cr = totals.regs > 0 ? (totals.deps / totals.regs) * 100 : NaN;
   totals.accountsWithoutSpend = rows
-    .filter((row) => !row.spendRows && (row.regs || row.deps || row.revenue))
+    .filter((row) => !row.spendRows && (row.installs || row.regs || row.deps || row.revenue))
     .length;
 
   return {
@@ -866,7 +915,7 @@ function formatAccountPerformance(performance, limit = 15) {
     `Аккаунтов: <b>${performance.rows.length}</b> | FB строк spend: <b>${performance.totals.spendRows}</b>`,
     `Spend: <b>${escapeHtml(formatMoney(totals.spend))} ${escapeHtml(currency)}</b> | Revenue: <b>${escapeHtml(formatMoney(totals.revenue))}</b>`,
     `Profit: <b>${escapeHtml(formatSignedMoney(totals.profit))} ${escapeHtml(currency)}</b> | ROI: <b>${escapeHtml(formatSignedPercent(totals.roi))}</b>`,
-    `Regs: <b>${totals.regs}</b> | Deps: <b>${totals.deps}</b> | CR: <b>${escapeHtml(formatSignedPercent(totals.cr).replace('+', ''))}</b>`,
+    `Installs: <b>${totals.installs}</b> | Regs: <b>${totals.regs}</b> | Deps: <b>${totals.deps}</b> | CR: <b>${escapeHtml(formatSignedPercent(totals.cr).replace('+', ''))}</b>`,
   ];
 
   if (!performance.totals.spendRows) {
@@ -889,7 +938,7 @@ function formatAccountPerformance(performance, limit = 15) {
     const roiText = hasPositiveSpend ? formatSignedPercent(row.roi) : '-';
     lines.push(`${index + 1}. <code>${escapeHtml(row.accountId)}</code>`);
     lines.push(`Spend <b>${escapeHtml(spendText)}</b> | Rev <b>${escapeHtml(formatMoney(row.revenue))}</b> | Profit <b>${escapeHtml(profitText)}</b> | ROI <b>${escapeHtml(roiText)}</b>`);
-    lines.push(`Reg ${row.regs} | Dep ${row.deps} | CR ${escapeHtml(formatSignedPercent(row.cr).replace('+', ''))} | CPL ${escapeHtml(formatCostPer(row.spend, row.regs, currency))} | CPA ${escapeHtml(formatCostPer(row.spend, row.deps, currency))}`);
+    lines.push(`Inst ${row.installs} | Reg ${row.regs} | Dep ${row.deps} | CR ${escapeHtml(formatSignedPercent(row.cr).replace('+', ''))} | CPI ${escapeHtml(formatCostPer(row.spend, row.installs, currency))} | CPL ${escapeHtml(formatCostPer(row.spend, row.regs, currency))} | CPA ${escapeHtml(formatCostPer(row.spend, row.deps, currency))}`);
   }
 
   if (performance.rows.length > limit) {
@@ -917,6 +966,7 @@ function buildAccountTrend(performances) {
       spend: 0,
       revenue: 0,
       profit: 0,
+      installs: 0,
       regs: 0,
       deps: 0,
       fbResults: 0,
@@ -932,6 +982,7 @@ function buildAccountTrend(performances) {
     spend: 0,
     revenue: 0,
     profit: 0,
+    installs: 0,
     regs: 0,
     deps: 0,
     fbResults: 0,
@@ -942,6 +993,7 @@ function buildAccountTrend(performances) {
   for (const performance of performances) {
     totals.spend += performance.totals.spend;
     totals.revenue += performance.totals.revenue;
+    totals.installs += performance.totals.installs;
     totals.regs += performance.totals.regs;
     totals.deps += performance.totals.deps;
     totals.fbResults += performance.totals.fbResults;
@@ -954,6 +1006,7 @@ function buildAccountTrend(performances) {
         dateYmd: performance.dateYmd,
         spend: Number(row.spend || 0),
         revenue: Number(row.revenue || 0),
+        installs: Number(row.installs || 0),
         regs: Number(row.regs || 0),
         deps: Number(row.deps || 0),
         fbResults: Number(row.fbResults || 0),
@@ -965,6 +1018,7 @@ function buildAccountTrend(performances) {
 
       item.spend += day.spend;
       item.revenue += day.revenue;
+      item.installs += day.installs;
       item.regs += day.regs;
       item.deps += day.deps;
       item.fbResults += day.fbResults;
@@ -988,7 +1042,7 @@ function buildAccountTrend(performances) {
       row.minusDays = row.days.filter((day) => day.spend > 0 && day.profit < 0).length;
       row.zeroDepDays = row.days.filter((day) => day.spend > 0 && day.deps === 0).length;
       row.missingSpendDays = row.days
-        .filter((day) => !day.spendRows && (day.regs || day.deps || day.revenue))
+        .filter((day) => !day.spendRows && (day.installs || day.regs || day.deps || day.revenue))
         .length;
       row.worstDay = row.days
         .filter((day) => day.spend > 0)
@@ -1024,12 +1078,12 @@ function formatTrendDay(day, dateYmd) {
   const label = shortDateLabel(dateYmd);
   if (!day) return `${label} -`;
   if (day.spendRows > 0 && day.spend > 0) {
-    return `${label} ${formatSignedPercent(day.roi)} ${day.deps}dep/${formatMoney(day.spend)}`;
+    return `${label} ${formatSignedPercent(day.roi)} ${day.installs}inst/${day.deps}dep/${formatMoney(day.spend)}`;
   }
   if (day.spendRows > 0) {
-    return `${label} 0spend ${day.deps}dep`;
+    return `${label} 0spend ${day.installs}inst/${day.deps}dep`;
   }
-  return `${label} ?spend ${day.deps}dep`;
+  return `${label} ?spend ${day.installs}inst/${day.deps}dep`;
 }
 
 function formatTrendDays(row, dates) {
@@ -1048,7 +1102,7 @@ function formatAccountTrend(trend, limit = 6) {
     'Сортировка: проблемные сверху.',
     `Spend: <b>${escapeHtml(formatMoney(totals.spend))} ${escapeHtml(currency)}</b> | Revenue: <b>${escapeHtml(formatMoney(totals.revenue))}</b>`,
     `Profit: <b>${escapeHtml(formatSignedMoney(totals.profit))} ${escapeHtml(currency)}</b> | ROI: <b>${escapeHtml(formatSignedPercent(totals.roi))}</b>`,
-    `Regs: <b>${totals.regs}</b> | Deps: <b>${totals.deps}</b> | CR: <b>${escapeHtml(formatSignedPercent(totals.cr).replace('+', ''))}</b>`,
+    `Installs: <b>${totals.installs}</b> | Regs: <b>${totals.regs}</b> | Deps: <b>${totals.deps}</b> | CR: <b>${escapeHtml(formatSignedPercent(totals.cr).replace('+', ''))}</b>`,
   ];
 
   if (totals.missingSpendAccountDays) {
@@ -1072,7 +1126,7 @@ function formatAccountTrend(trend, limit = 6) {
 
     lines.push(`${index + 1}. <code>${escapeHtml(row.accountId)}</code>${flags.length ? ` (${escapeHtml(flags.join(', '))})` : ''}`);
     lines.push(`Spend <b>${hasSpendRow ? `${escapeHtml(formatMoney(row.spend))} ${escapeHtml(currency)}` : '-'}</b> | Rev <b>${escapeHtml(formatMoney(row.revenue))}</b> | Profit <b>${hasPositiveSpend ? `${escapeHtml(formatSignedMoney(row.profit))} ${escapeHtml(currency)}` : '-'}</b> | ROI <b>${hasPositiveSpend ? escapeHtml(formatSignedPercent(row.roi)) : '-'}</b>`);
-    lines.push(`Reg ${row.regs} | Dep ${row.deps} | CR ${escapeHtml(formatSignedPercent(row.cr).replace('+', ''))} | CPA ${escapeHtml(formatCostPer(row.spend, row.deps, currency))}`);
+    lines.push(`Inst ${row.installs} | Reg ${row.regs} | Dep ${row.deps} | CR ${escapeHtml(formatSignedPercent(row.cr).replace('+', ''))} | CPI ${escapeHtml(formatCostPer(row.spend, row.installs, currency))} | CPA ${escapeHtml(formatCostPer(row.spend, row.deps, currency))}`);
     if (row.worstDay) {
       lines.push(`Худший день: ${shortDateLabel(row.worstDay.dateYmd)} ${escapeHtml(formatSignedMoney(row.worstDay.profit))} ${escapeHtml(currency)}, ROI ${escapeHtml(formatSignedPercent(row.worstDay.roi))}, dep ${row.worstDay.deps}`);
     }
@@ -1105,9 +1159,11 @@ function spendSnapshotKey(row) {
 
 function formatSpendImport(importBatch, canPush) {
   const summary = summarizeSpendRows(importBatch.rows);
+  const fileCount = Number(importBatch.files?.length || importBatch.file_count || 0);
   const lines = [
-    '<b>FB CSV импортирован</b>',
+    fileCount > 1 ? '<b>FB CSV импортированы</b>' : '<b>FB CSV импортирован</b>',
     `ID: <code>${escapeHtml(importBatch.importId)}</code>`,
+    fileCount > 1 ? `Файлов: <b>${fileCount}</b>` : '',
     `Даты: <b>${escapeHtml(summary.dates.join(', ') || '-')}</b>`,
     `Строк FB: <b>${importBatch.sourceRows}</b>`,
     `Групп sub5: <b>${summary.rows}</b>`,
@@ -1118,7 +1174,7 @@ function formatSpendImport(importBatch, canPush) {
       ? 'Можно отправить эти расходы в Keitaro кнопкой ниже. Бот сам найдет Keitaro campaign_id по sub_id_5.'
       : 'В Keitaro не отправлял: сначала задай Keitaro API key в настройках бота.',
   ];
-  return lines.join('\n');
+  return lines.filter((line) => line !== '').join('\n');
 }
 
 function formatSkippedCostRows(rows, currency, limit = 10) {
@@ -1126,6 +1182,9 @@ function formatSkippedCostRows(rows, currency, limit = 10) {
   const lines = safeRows.slice(0, limit).map((row) => {
     const label = row.creative || row.campaignName || row.sub5 || '-';
     const number = row.rowNumber ? `#${row.rowNumber} ` : '';
+    const gptNote = row.gptMatch
+      ? `; GPT: ${escapeHtml(row.gptMatch.status)} ${escapeHtml(formatSignedPercent(Number(row.gptMatch.confidence || 0) * 100).replace('+', ''))} - ${escapeHtml(row.gptMatch.reason || '')}`
+      : (row.gptError ? `; GPT error: ${escapeHtml(row.gptError)}` : '');
     const candidates = (row.candidateCampaigns || [])
       .map((campaign) => [
         campaign.campaignId,
@@ -1135,7 +1194,7 @@ function formatSkippedCostRows(rows, currency, limit = 10) {
     const groupNote = candidates.length
       ? `; найдено не в той группе: ${escapeHtml([...new Set(candidates)].join(', '))}`
       : '; кликов по sub5 не найдено';
-    return `- ${number}<b>${escapeHtml(formatMoney(row.spend))} ${escapeHtml(currency || row.currency || 'USD')}</b> <code>${escapeHtml(label)}</code>${groupNote}`;
+    return `- ${number}<b>${escapeHtml(formatMoney(row.spend))} ${escapeHtml(currency || row.currency || 'USD')}</b> <code>${escapeHtml(label)}</code>${groupNote}${gptNote}`;
   });
 
   if (safeRows.length > limit) {
@@ -1180,11 +1239,12 @@ function costsHelpText() {
     '1. В Ads Manager выгрузи CSV по кампаниям за нужную дату.',
     '2. В отчете должны быть колонки campaign name и amount spent.',
     '3. Название кампании должно совпадать с нашим sub5.',
-    '4. Отправь CSV файлом прямо сюда в бот.',
+    '4. Отправь один CSV или несколько CSV одним сообщением прямо сюда в бот.',
     '',
     '<b>Чтобы бот мог залить costs в Keitaro</b>',
     'Задай Keitaro API key и проверь, что название FB-кампании попадает в <code>sub_id_5</code>.',
     'Campaign IDs вводить не нужно: бот найдет их сам через Keitaro report по <code>sub_id_5</code>.',
+    'GPT fallback: <code>/set openai_key sk-...</code>, <code>/set gpt_cost_routing on</code>, <code>/set gpt_cost_confidence 0.85</code>.',
     '',
     'Бот отправляет costs через Keitaro Admin API bulk update и ставит фильтр <code>sub_id_5</code> на каждую строку CSV.',
   ].join('\n');
@@ -1458,6 +1518,7 @@ function buildKeitaroConfig(config, date, verbose = false) {
     apiKey: config.keitaroApiKey,
     timezone: config.keitaroTimezone || DEFAULT_TIMEZONE,
     limit: Number.isFinite(config.apiLimit) && config.apiLimit > 0 ? config.apiLimit : DEFAULT_LIMIT,
+    installCampaignGroup: config.costCampaignGroup || '',
     verbose,
   };
 }
@@ -1470,6 +1531,7 @@ export class KeitaroTelegramBot {
     this.offset = 0;
     this.running = false;
     this.chatModes = new Map();
+    this.pendingDocumentGroups = new Map();
     this.scheduledAnalyticsRunning = false;
   }
 
@@ -1559,6 +1621,20 @@ export class KeitaroTelegramBot {
       costCampaignGroup: profile.costCampaignGroup || this.config.costCampaignGroup || '',
       costAutoPush: Boolean(profile.costAutoPush ?? this.config.costAutoPush),
       costOnlyCampaignUniques: profile.costOnlyCampaignUniques ?? this.config.costOnlyCampaignUniques ?? true,
+      openaiApiKey: profile.openaiApiKey || this.config.openaiApiKey || '',
+      openaiBaseUrl: profile.openaiBaseUrl || this.config.openaiBaseUrl || 'https://api.openai.com/v1',
+      openaiModel: profile.openaiModel || this.config.openaiModel || 'gpt-4o-mini',
+      gptCostRoutingEnabled: profile.gptCostRoutingEnabled ?? this.config.gptCostRoutingEnabled ?? true,
+      gptCostRoutingMinConfidence: Number.isFinite(Number(profile.gptCostRoutingMinConfidence))
+        ? Number(profile.gptCostRoutingMinConfidence)
+        : Number.isFinite(Number(this.config.gptCostRoutingMinConfidence))
+          ? Number(this.config.gptCostRoutingMinConfidence)
+          : 0.85,
+      gptCostRoutingCandidateLimit: Number.isFinite(Number(profile.gptCostRoutingCandidateLimit))
+        ? Number(profile.gptCostRoutingCandidateLimit)
+        : Number.isFinite(Number(this.config.gptCostRoutingCandidateLimit))
+          ? Number(this.config.gptCostRoutingCandidateLimit)
+          : 40,
       dailyDigestEnabled: profile.dailyDigestEnabled ?? this.config.dailyDigestEnabled ?? true,
       dailyDigestHour: normalizeReportHour(
         Number.isFinite(Number(profile.dailyDigestHour)) ? Number(profile.dailyDigestHour) : this.config.dailyDigestHour,
@@ -1601,7 +1677,7 @@ export class KeitaroTelegramBot {
 
     if (message.document) {
       try {
-        await this.handleDocument(chatId, message.document);
+        await this.handleDocument(chatId, message.document, message);
       } catch (error) {
         await this.telegram.sendMessage(chatId, `Ошибка: ${error.message}`);
       }
@@ -1747,13 +1823,13 @@ export class KeitaroTelegramBot {
 
       if (data === 'mode:report_date') {
         this.chatModes.set(String(chatId), { type: 'report_date' });
-        await this.telegram.sendMessage(chatId, 'Пришли дату для отчета, например 2026-05-26 или 26 мая 2026.');
+        await this.telegram.sendMessage(chatId, 'Пришли дату для отчета, например 2026-05-26, 26 мая 2026, позавчера или суббота.');
         return;
       }
 
       if (data === 'mode:offer_date') {
         this.chatModes.set(String(chatId), { type: 'offer_date' });
-        await this.telegram.sendMessage(chatId, 'Пришли дату для отчета по офферам, например 2026-05-26 или 26 мая 2026.');
+        await this.telegram.sendMessage(chatId, 'Пришли дату для отчета по офферам, например 2026-05-26, 26 мая 2026, позавчера или суббота.');
         return;
       }
 
@@ -1796,6 +1872,11 @@ export class KeitaroTelegramBot {
         return;
       }
 
+      if (data === 'report:2d') {
+        await this.askReportWindow(chatId, 'sub5', '2d');
+        return;
+      }
+
       if (data === 'offers:today') {
         await this.askReportWindow(chatId, 'offers', 'today');
         return;
@@ -1803,6 +1884,11 @@ export class KeitaroTelegramBot {
 
       if (data === 'offers:yesterday') {
         await this.askReportWindow(chatId, 'offers', 'yesterday');
+        return;
+      }
+
+      if (data === 'offers:2d') {
+        await this.askReportWindow(chatId, 'offers', '2d');
         return;
       }
 
@@ -2041,6 +2127,7 @@ export class KeitaroTelegramBot {
       `Cost fallback IDs: ${(config.costCampaignIds || []).join(', ') || 'not set'}`,
       `Cost campaign group: ${config.costCampaignGroup || 'buyer from sub_id_5'}`,
       `Cost auto push: ${config.costAutoPush ? 'on' : 'off'}`,
+      `GPT cost fallback: ${config.gptCostRoutingEnabled && config.openaiApiKey ? `on (${config.openaiModel}, min ${config.gptCostRoutingMinConfidence})` : 'off'}`,
       `Daily digest: ${config.dailyDigestEnabled ? `on at ${config.dailyDigestHour}:00` : 'off'}`,
       `Auto alerts: ${config.autoAlertsEnabled ? 'on' : 'off'}`,
       `Known chats: ${chats.length}`,
@@ -2096,6 +2183,11 @@ export class KeitaroTelegramBot {
         `Группа: ${config.costCampaignGroup || 'buyer from sub_id_5'}`,
         `Автоотправка: ${config.costAutoPush ? 'on' : 'off'}`,
         `Fallback IDs: ${(config.costCampaignIds || []).join(', ') || 'not set'}`,
+        `OpenAI key: ${maskSecret(config.openaiApiKey)}`,
+        `GPT fallback: ${config.gptCostRoutingEnabled ? 'on' : 'off'}`,
+        `GPT model: ${config.openaiModel}`,
+        `GPT min confidence: ${config.gptCostRoutingMinConfidence}`,
+        `GPT candidates: ${config.gptCostRoutingCandidateLimit}`,
       ];
     } else {
       lines = [
@@ -2142,6 +2234,18 @@ export class KeitaroTelegramBot {
       patch.costAutoPush = parseBooleanSetting(value);
     } else if (['cost_only_uniques', 'only_campaign_uniques'].includes(key)) {
       patch.costOnlyCampaignUniques = parseBooleanSetting(value);
+    } else if (['openai_key', 'openai_api_key'].includes(key)) {
+      patch.openaiApiKey = value;
+    } else if (['openai_model', 'gpt_model'].includes(key)) {
+      patch.openaiModel = clean(value);
+    } else if (['gpt_cost_routing', 'gpt_costs', 'cost_gpt_fallback'].includes(key)) {
+      patch.gptCostRoutingEnabled = parseBooleanSetting(value);
+    } else if (['gpt_cost_confidence', 'gpt_cost_min_confidence'].includes(key)) {
+      const confidence = Number(value);
+      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) throw new Error('GPT confidence должен быть числом от 0 до 1.');
+      patch.gptCostRoutingMinConfidence = confidence;
+    } else if (['gpt_cost_candidate_limit', 'gpt_candidates'].includes(key)) {
+      patch.gptCostRoutingCandidateLimit = numberSetting(value, { min: 1, max: 100 });
     } else if (['daily_digest', 'daily_digest_enabled', 'digest'].includes(key)) {
       patch.dailyDigestEnabled = parseBooleanSetting(value);
     } else if (['daily_digest_hour', 'digest_hour'].includes(key)) {
@@ -2249,25 +2353,97 @@ export class KeitaroTelegramBot {
     });
   }
 
-  async handleDocument(chatId, document) {
-    const filename = document.file_name || '';
-    if (!/\.csv$/i.test(filename)) {
-      await this.telegram.sendMessage(chatId, 'Сейчас я понимаю только CSV-файлы с расходами Facebook Ads.', {
+  queueDocumentGroup(chatId, mediaGroupId, document) {
+    const key = `${chatId}:${mediaGroupId}`;
+    const current = this.pendingDocumentGroups.get(key) || {
+      chatId,
+      documents: [],
+      documentIds: new Set(),
+      timer: null,
+    };
+    const documentId = document.file_unique_id || document.file_id || `${document.file_name || 'file'}:${current.documents.length}`;
+    if (!current.documentIds.has(documentId)) {
+      current.documentIds.add(documentId);
+      current.documents.push(document);
+    }
+
+    if (current.timer) clearTimeout(current.timer);
+    current.timer = setTimeout(() => {
+      this.pendingDocumentGroups.delete(key);
+      this.handleDocuments(current.chatId, current.documents).catch(async (error) => {
+        await this.telegram.sendMessage(current.chatId, `Ошибка: ${error.message}`).catch(() => {});
+      });
+    }, DOCUMENT_GROUP_COLLECT_MS);
+
+    this.pendingDocumentGroups.set(key, current);
+  }
+
+  async handleDocument(chatId, document, message = {}) {
+    if (message.media_group_id) {
+      this.queueDocumentGroup(chatId, message.media_group_id, document);
+      return;
+    }
+
+    await this.handleDocuments(chatId, [document]);
+  }
+
+  async handleDocuments(chatId, documents) {
+    const safeDocuments = (Array.isArray(documents) ? documents : []).filter(Boolean);
+    if (!safeDocuments.length) return;
+
+    const invalidFiles = safeDocuments
+      .map((document) => document.file_name || '')
+      .filter((filename) => !/\.csv$/i.test(filename));
+    if (invalidFiles.length) {
+      await this.telegram.sendMessage(chatId, [
+        'Сейчас я понимаю только CSV-файлы с расходами Facebook Ads.',
+        `Не CSV: ${invalidFiles.join(', ')}`,
+      ].join('\n'), {
         reply_markup: spendKeyboard(),
       });
       return;
     }
 
     const config = await this.profileConfig();
-    const file = await this.telegram.getFile(document.file_id);
-    const buffer = await this.telegram.downloadFile(file.file_path);
-    const text = decodeTelegramText(buffer);
-    const importBatch = parseFacebookSpendCsv(text, {
-      currency: config.costCurrency || 'USD',
-    });
+    const parsedFiles = [];
+    for (const [index, document] of safeDocuments.entries()) {
+      const filename = document.file_name || `facebook-spend-${index + 1}.csv`;
+      const file = await this.telegram.getFile(document.file_id);
+      const buffer = await this.telegram.downloadFile(file.file_path);
+      const text = decodeTelegramText(buffer);
+      let batch;
+      try {
+        batch = parseFacebookSpendCsv(text, {
+          currency: config.costCurrency || 'USD',
+        });
+      } catch (error) {
+        throw new Error(`${filename}: ${error.message}`);
+      }
+
+      batch.files = [{
+        filename,
+        sourceRows: batch.sourceRows,
+        groupedRows: batch.rows.length,
+        totalSpend: batch.totalSpend,
+        dates: batch.dates,
+      }];
+      batch.rows = batch.rows.map((row) => ({
+        ...row,
+        sourceFiles: [filename],
+      }));
+      parsedFiles.push({ filename, batch });
+    }
+
+    const importBatch = combineFacebookSpendImports(
+      parsedFiles.map((file) => file.batch),
+      { force: parsedFiles.length > 1, currency: config.costCurrency || 'USD' },
+    );
+    const filenames = parsedFiles.map((file) => file.filename);
 
     await this.db.saveFacebookSpendImport(importBatch, {
-      filename,
+      filename: filenames[0],
+      filenames,
+      file_count: filenames.length,
       chat_id: String(chatId),
     });
 
@@ -2450,6 +2626,14 @@ export class KeitaroTelegramBot {
       currency: config.costCurrency || importBatch.currency || 'USD',
       onlyCampaignUniques: config.costOnlyCampaignUniques !== false,
       campaignGroup: config.costCampaignGroup || '',
+      gptRouting: {
+        enabled: config.gptCostRoutingEnabled,
+        openaiApiKey: config.openaiApiKey,
+        openaiBaseUrl: config.openaiBaseUrl,
+        openaiModel: config.openaiModel,
+        minConfidence: config.gptCostRoutingMinConfidence,
+        candidateLimit: config.gptCostRoutingCandidateLimit,
+      },
       windowStartHour: costWindowStartHour,
       onProgress: async (event) => {
         if (event.stage === 'lookup') {
@@ -2466,9 +2650,26 @@ export class KeitaroTelegramBot {
             `Import: <code>${escapeHtml(importId)}</code>`,
             `Нашел строк: <b>${event.resolvedRows.length}</b>`,
             `Не нашел: <b>${event.unresolvedRows.length}</b>`,
+            event.gptResolvedRows?.length ? `GPT нашел: <b>${event.gptResolvedRows.length}</b>` : '',
             '',
             'Шаг 3/3: отправляю bulk job в Keitaro.',
+          ].filter(Boolean));
+        }
+        if (event.stage === 'gpt_prepare') {
+          await showProgress([
+            '<b>Отправляю costs в Keitaro</b>',
+            `Import: <code>${escapeHtml(importId)}</code>`,
+            `GPT fallback: проверяю <b>${event.total}</b> строк без campaign_id.`,
           ]);
+        }
+        if (event.stage === 'gpt_lookup') {
+          await showProgress([
+            '<b>Отправляю costs в Keitaro</b>',
+            `Import: <code>${escapeHtml(importId)}</code>`,
+            `GPT fallback: строка <b>${event.current}/${event.total}</b>.`,
+            event.row?.creative ? `Строка: <code>${escapeHtml(event.row.creative)}</code>` : '',
+            `Кандидатов: <b>${event.candidates?.length || 0}</b>`,
+          ].filter(Boolean));
         }
         if (event.stage === 'send_job') {
           await showProgress([
@@ -2488,6 +2689,8 @@ export class KeitaroTelegramBot {
       data: result.data,
       unresolvedRows: result.unresolvedRows,
       ambiguousRows: result.ambiguousRows,
+      gptResolvedRows: result.gptResolvedRows,
+      gptAttemptedRows: result.gptAttemptedRows,
       staleRows,
     });
 
@@ -2502,6 +2705,9 @@ export class KeitaroTelegramBot {
       `Строк costs: <b>${result.costRows}</b>`,
       `Сумма: <b>${escapeHtml(formatMoney(result.totalCost))} ${escapeHtml(costCurrency)}</b>`,
     ];
+    if (result.gptResolvedRows?.length) {
+      responseLines.push(`GPT fallback: <b>${result.gptResolvedRows.length}</b> строк.`);
+    }
     if (skippedCount) {
       responseLines.push(`Skipped: <b>${skippedCount}</b> строк.`);
       if (staleRows.length) {
@@ -2528,7 +2734,10 @@ export class KeitaroTelegramBot {
         );
       }
       if (result.ambiguousRows?.length) {
-        responseLines.push(`Неоднозначных строк: <b>${result.ambiguousRows.length}</b>.`);
+        responseLines.push(
+          `Неоднозначных строк: <b>${result.ambiguousRows.length}</b>.`,
+          ...formatSkippedCostRows(result.ambiguousRows, costCurrency),
+        );
       }
     }
     responseLines.push('', 'Keitaro поставил bulk job в очередь. Обновление в отчетах может появиться не сразу.');
@@ -2829,6 +3038,7 @@ export class KeitaroTelegramBot {
         baseUrl: normalizeBaseUrl(config.keitaroBaseUrl || DEFAULT_BASE_URL),
         apiKey: config.keitaroApiKey,
         timezone: config.keitaroTimezone || DEFAULT_TIMEZONE,
+        installCampaignGroup: config.costCampaignGroup || parseSub5(sub5).buyer,
         limit: Number.isFinite(config.apiLimit) && config.apiLimit > 0 ? config.apiLimit : DEFAULT_LIMIT,
       });
       source = 'Keitaro API';

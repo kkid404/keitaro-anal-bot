@@ -28,6 +28,7 @@ function createDb(config) {
 
 async function main() {
   await loadDotEnv(path.join(scriptDir, '.env'));
+  await loadDotEnv(path.join(scriptDir, '..', '.env'));
   const config = readConfig();
   config.dataDir = resolveInsideScriptDir(config.dataDir);
 

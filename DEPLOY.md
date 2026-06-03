@@ -1,5 +1,29 @@
 # Быстрый деплой на сервер
 
+## В составе общего проекта
+
+Из корня `keitaro-mcp` теперь можно поднять bot + dashboard + PostgreSQL одной командой:
+
+```bash
+cp .env.example .env
+# заполни KEITARO_URL, KEITARO_API_KEY, TELEGRAM_BOT_TOKEN, WEBHOOK_TOKEN
+docker compose up -d --build
+```
+
+Локальный healthcheck бота:
+
+```text
+http://127.0.0.1:3000/health
+```
+
+Для публичного HTTPS webhook через Caddy:
+
+```bash
+docker compose --profile proxy up -d --build
+```
+
+Перед этим задай `APP_DOMAIN` в корневом `.env`.
+
 ## 1. Домен
 
 В DNS у домена создай A-запись:

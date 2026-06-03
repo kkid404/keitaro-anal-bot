@@ -190,6 +190,10 @@ function currencyFromHeader(header, fallback) {
   return (match?.[1] || fallback || 'USD').toUpperCase();
 }
 
+function createImportId() {
+  return `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
+}
+
 export function parseCampaignIds(value) {
   return clean(value)
     .split(/[,\s]+/)
@@ -197,15 +201,33 @@ export function parseCampaignIds(value) {
     .filter((item) => Number.isInteger(item) && item > 0);
 }
 
-async function requestKeitaroJson({ baseUrl, apiKey, path, payload }) {
-  const response = await fetch(`${normalizeBaseUrl(baseUrl)}${path}`, {
-    method: 'POST',
+async function requestKeitaroJson({
+  baseUrl,
+  apiKey,
+  path,
+  payload,
+  method = 'POST',
+  query = {},
+}) {
+  const endpoint = new URL(`${normalizeBaseUrl(baseUrl)}${path}`);
+  for (const [key, value] of Object.entries(query || {})) {
+    if (value !== undefined && value !== null && value !== '') {
+      endpoint.searchParams.set(key, String(value));
+    }
+  }
+
+  const requestOptions = {
+    method,
     headers: {
       'Content-Type': 'application/json',
       'Api-Key': apiKey,
     },
-    body: JSON.stringify(payload),
-  });
+  };
+  if (method !== 'GET') {
+    requestOptions.body = JSON.stringify(payload || {});
+  }
+
+  const response = await fetch(endpoint, requestOptions);
   const text = await response.text();
   if (!response.ok) {
     throw new Error(`Keitaro API вернул ${response.status}: ${text.slice(0, 500)}`);
@@ -226,6 +248,12 @@ function normalizeApiRows(data) {
   });
 }
 
+function normalizeApiList(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.rows)) return normalizeApiRows(data);
+  return [];
+}
+
 function numberList(values) {
   return [...new Set(values
     .map((value) => Number(value))
@@ -243,6 +271,287 @@ function normalizeCampaignRow(row) {
     campaignGroup: clean(row.campaign_group),
     campaignGroupId: Number(row.campaign_group_id) || 0,
     clicks: Number(row.clicks || 0),
+  };
+}
+
+function normalizeCampaignListRow(row, groupNames = new Map()) {
+  const campaignGroupId = Number(row.group_id || row.campaign_group_id) || 0;
+  return {
+    campaignId: Number(row.id || row.campaign_id),
+    campaign: clean(row.name || row.campaign || row.alias),
+    campaignGroup: clean(row.group || row.group_name || row.campaign_group || groupNames.get(campaignGroupId)),
+    campaignGroupId,
+    state: clean(row.state || 'active'),
+  };
+}
+
+async function fetchKeitaroCampaignGroups({ baseUrl, apiKey }) {
+  const data = await requestKeitaroJson({
+    baseUrl,
+    apiKey,
+    method: 'GET',
+    path: '/admin_api/v1/groups',
+    query: { type: 'campaigns' },
+  }).catch(() => []);
+  return normalizeApiList(data);
+}
+
+async function fetchKeitaroCampaigns({ baseUrl, apiKey, limit = 1000 }) {
+  const groups = await fetchKeitaroCampaignGroups({ baseUrl, apiKey });
+  const groupNames = new Map(groups
+    .map((group) => [Number(group.id), clean(group.name)])
+    .filter(([id, name]) => Number.isInteger(id) && id > 0 && name));
+  const campaigns = [];
+
+  for (let offset = 0, page = 0; page < 20; offset += limit, page += 1) {
+    const data = await requestKeitaroJson({
+      baseUrl,
+      apiKey,
+      method: 'GET',
+      path: '/admin_api/v1/campaigns',
+      query: { limit, offset },
+    });
+    const batch = normalizeApiList(data)
+      .map((row) => normalizeCampaignListRow(row, groupNames))
+      .filter((row) => Number.isInteger(row.campaignId) && row.campaignId > 0 && row.campaign);
+    campaigns.push(...batch);
+    if (batch.length < limit) break;
+  }
+
+  return campaigns;
+}
+
+function stripCopyMarkers(value) {
+  return clean(value)
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/\b(для\s+коп\w*)\b/giu, ' ')
+    .replace(/\b(copy|copies|copie|clone|duplicat\w*)\b/gu, ' ')
+    .replace(/\b(копия|копии|копий|коп|дубль)\b/giu, ' ')
+    .replace(/\b(для)\b/giu, ' ');
+}
+
+function matchTokens(value) {
+  return stripCopyMarkers(value)
+    .split(/[^\p{L}\p{N}]+/u)
+    .map(clean)
+    .filter((token) => token.length > 1);
+}
+
+function campaignMatchScore(source, candidate) {
+  const sourceText = stripCopyMarkers(source);
+  const candidateText = stripCopyMarkers(candidate);
+  if (!sourceText || !candidateText) return 0;
+  if (sourceText === candidateText) return 10;
+
+  const sourceTokens = new Set(matchTokens(sourceText));
+  const candidateTokens = new Set(matchTokens(candidateText));
+  if (!sourceTokens.size || !candidateTokens.size) return 0;
+
+  const overlap = [...sourceTokens].filter((token) => candidateTokens.has(token)).length;
+  const union = new Set([...sourceTokens, ...candidateTokens]).size;
+  const jaccard = union ? overlap / union : 0;
+  const contains = sourceText.includes(candidateText) || candidateText.includes(sourceText) ? 1 : 0;
+  return jaccard * 8 + contains * 2;
+}
+
+function candidateLabel(row) {
+  return clean(row.campaign || row.campaignName || row.sub5 || '');
+}
+
+function selectGptCampaignCandidates(campaigns, spendRow, campaignGroup, limit = 40) {
+  const targetGroup = targetCampaignGroupForRow(spendRow, campaignGroup);
+  const normalizedTarget = normalizeGroupName(targetGroup);
+  const source = candidateLabel(spendRow);
+  const scoped = campaigns
+    .filter((campaign) => clean(campaign.state).toLowerCase() !== 'deleted')
+    .filter((campaign) => (
+      !normalizedTarget || normalizeGroupName(campaign.campaignGroup) === normalizedTarget
+    ));
+
+  return scoped
+    .map((campaign) => ({
+      ...campaign,
+      matchScore: campaignMatchScore(source, campaign.campaign),
+    }))
+    .sort((a, b) => (
+      b.matchScore - a.matchScore
+      || a.campaign.localeCompare(b.campaign, undefined, { numeric: true, sensitivity: 'base' })
+    ))
+    .slice(0, Math.max(1, Math.min(100, Number(limit) || 40)));
+}
+
+function openAiEndpoint(baseUrl) {
+  return `${clean(baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '')}/responses`;
+}
+
+function extractOpenAiOutputText(data) {
+  if (clean(data?.output_text)) return clean(data.output_text);
+  for (const item of data?.output || []) {
+    for (const content of item.content || []) {
+      if (clean(content.text)) return clean(content.text);
+      if (clean(content.output_text)) return clean(content.output_text);
+    }
+  }
+  return '';
+}
+
+function gptRouteSchema() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['status', 'target_campaign_id', 'confidence', 'reason'],
+    properties: {
+      status: {
+        type: 'string',
+        enum: ['matched', 'needs_confirmation', 'unmatched'],
+      },
+      target_campaign_id: {
+        type: 'integer',
+        description: 'Use 0 when there is no reliable target campaign.',
+      },
+      confidence: {
+        type: 'number',
+      },
+      reason: {
+        type: 'string',
+      },
+    },
+  };
+}
+
+function buildGptRoutePrompt({ spendRow, targetGroup, sourceCampaigns, candidates }) {
+  return JSON.stringify({
+    task: 'Route ad spend to the correct main Keitaro campaign.',
+    rules: [
+      'Choose only one target_campaign_id from candidates.',
+      'The target must be in the main buyer campaign group.',
+      'The source campaign may be a copy/app-layer campaign.',
+      'Names usually differ by small copy markers or suffixes.',
+      'If the match is not reliable, return needs_confirmation or unmatched.',
+      'Never invent campaign IDs.',
+    ],
+    target_group: targetGroup,
+    spend: {
+      row_number: spendRow.rowNumber || 0,
+      date: spendRow.dateYmd || '',
+      amount: Number(spendRow.spend || 0),
+      currency: spendRow.currency || '',
+      source_campaign_name: spendRow.campaignName || spendRow.sub5 || '',
+      sub5: spendRow.sub5 || '',
+      buyer: spendRow.buyer || parseSub5(spendRow.sub5 || '').buyer,
+      geo: spendRow.geo || parseSub5(spendRow.sub5 || '').geo,
+      account_id: spendRow.accountId || parseSub5(spendRow.sub5 || '').accountId,
+      creative: spendRow.creative || parseSub5(spendRow.sub5 || '').creative,
+    },
+    source_campaigns_found_by_clicks: sourceCampaigns.map((campaign) => ({
+      campaign_id: campaign.campaignId,
+      name: campaign.campaign,
+      group: campaign.campaignGroup,
+      clicks: campaign.clicks,
+    })),
+    candidates: candidates.map((campaign) => ({
+      campaign_id: campaign.campaignId,
+      name: campaign.campaign,
+      group: campaign.campaignGroup,
+      state: campaign.state,
+      lexical_score: Number(campaign.matchScore || 0).toFixed(3),
+    })),
+  });
+}
+
+async function routeCampaignWithGpt({
+  openaiApiKey,
+  openaiBaseUrl,
+  openaiModel,
+  spendRow,
+  targetGroup,
+  sourceCampaigns,
+  candidates,
+}) {
+  if (!openaiApiKey) throw new Error('OpenAI API key is not configured.');
+  if (!candidates.length) {
+    return {
+      status: 'unmatched',
+      target_campaign_id: 0,
+      confidence: 0,
+      reason: 'No target campaign candidates were available.',
+    };
+  }
+
+  const response = await fetch(openAiEndpoint(openaiBaseUrl), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${openaiApiKey}`,
+    },
+    body: JSON.stringify({
+      model: openaiModel || 'gpt-4o-mini',
+      input: [
+        {
+          role: 'system',
+          content: [
+            'You are a careful traffic-ops routing assistant.',
+            'Return JSON only through the provided schema.',
+            'You map Facebook spend from copy/source campaign names to the correct main Keitaro campaign.',
+            'Prefer not matching over a risky wrong match.',
+          ].join(' '),
+        },
+        {
+          role: 'user',
+          content: buildGptRoutePrompt({
+            spendRow,
+            targetGroup,
+            sourceCampaigns,
+            candidates,
+          }),
+        },
+      ],
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'campaign_cost_route',
+          strict: true,
+          schema: gptRouteSchema(),
+        },
+      },
+      max_output_tokens: 500,
+    }),
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`OpenAI API returned ${response.status}: ${text.slice(0, 500)}`);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`OpenAI API returned non-JSON response: ${text.slice(0, 500)}`);
+  }
+
+  const outputText = extractOpenAiOutputText(data);
+  if (!outputText) throw new Error('OpenAI API returned empty output.');
+
+  try {
+    return JSON.parse(outputText);
+  } catch {
+    throw new Error(`OpenAI output is not valid JSON: ${outputText.slice(0, 500)}`);
+  }
+}
+
+function normalizeGptRoutingOptions(options = {}) {
+  const minConfidence = Number(options.minConfidence);
+  const candidateLimit = Number(options.candidateLimit);
+  return {
+    enabled: options.enabled !== false && Boolean(options.openaiApiKey),
+    openaiApiKey: clean(options.openaiApiKey),
+    openaiBaseUrl: clean(options.openaiBaseUrl || 'https://api.openai.com/v1'),
+    openaiModel: clean(options.openaiModel || 'gpt-4o-mini'),
+    minConfidence: Number.isFinite(minConfidence) ? Math.min(1, Math.max(0, minConfidence)) : 0.85,
+    candidateLimit: Number.isFinite(candidateLimit) ? Math.max(1, Math.min(100, Math.trunc(candidateLimit))) : 40,
   };
 }
 
@@ -333,12 +642,17 @@ export async function resolveCampaignIdsForSpendRows({
   timezone,
   fallbackCampaignIds = [],
   campaignGroup = '',
+  gptRouting = {},
   onProgress,
 }) {
   const fallbackIds = numberList(fallbackCampaignIds);
+  const gptOptions = normalizeGptRoutingOptions(gptRouting);
   const cache = new Map();
   const resolvedRows = [];
   const unresolvedRows = [];
+  const ambiguousRows = [];
+  const gptResolvedRows = [];
+  const gptAttemptedRows = [];
   const rows = spendRows || [];
 
   for (const [index, row] of rows.entries()) {
@@ -384,17 +698,129 @@ export async function resolveCampaignIdsForSpendRows({
     });
   }
 
+  if (gptOptions.enabled && unresolvedRows.length) {
+    await onProgress?.({
+      stage: 'gpt_prepare',
+      total: unresolvedRows.length,
+    });
+
+    let allCampaigns = [];
+    let campaignFetchError = null;
+    try {
+      allCampaigns = await fetchKeitaroCampaigns({ baseUrl, apiKey });
+    } catch (error) {
+      campaignFetchError = error;
+    }
+
+    const stillUnresolvedRows = [];
+    for (const [index, row] of unresolvedRows.entries()) {
+      if (campaignFetchError) {
+        stillUnresolvedRows.push({
+          ...row,
+          gptError: campaignFetchError.message,
+        });
+        continue;
+      }
+
+      const targetGroup = targetCampaignGroupForRow(row, campaignGroup);
+      const candidates = selectGptCampaignCandidates(
+        allCampaigns,
+        row,
+        campaignGroup,
+        gptOptions.candidateLimit,
+      );
+      await onProgress?.({
+        stage: 'gpt_lookup',
+        current: index + 1,
+        total: unresolvedRows.length,
+        row,
+        candidates,
+      });
+
+      if (!candidates.length) {
+        stillUnresolvedRows.push({
+          ...row,
+          gptError: 'No target campaign candidates found.',
+        });
+        continue;
+      }
+
+      try {
+        const gptMatch = await routeCampaignWithGpt({
+          ...gptOptions,
+          spendRow: row,
+          targetGroup,
+          sourceCampaigns: row.candidateCampaigns || [],
+          candidates,
+        });
+        const targetId = Number(gptMatch.target_campaign_id || 0);
+        const targetCampaign = candidates.find((campaign) => campaign.campaignId === targetId);
+        const confidence = Number(gptMatch.confidence || 0);
+        const routedRow = {
+          ...row,
+          targetCampaignGroup: targetGroup,
+          candidateCampaigns: row.candidateCampaigns || [],
+          gptCandidates: candidates,
+          gptMatch: {
+            status: clean(gptMatch.status),
+            targetCampaignId: targetId,
+            confidence,
+            reason: clean(gptMatch.reason),
+          },
+        };
+        gptAttemptedRows.push(routedRow);
+
+        if (
+          gptMatch.status === 'matched'
+          && targetCampaign
+          && confidence >= gptOptions.minConfidence
+        ) {
+          const resolvedRow = {
+            ...routedRow,
+            campaignIds: [targetCampaign.campaignId],
+            campaignRows: [targetCampaign],
+            campaignIdSource: 'gpt',
+          };
+          resolvedRows.push(resolvedRow);
+          gptResolvedRows.push(resolvedRow);
+        } else if (targetCampaign) {
+          ambiguousRows.push({
+            ...routedRow,
+            campaignIds: [targetCampaign.campaignId],
+            campaignRows: [targetCampaign],
+          });
+        } else {
+          stillUnresolvedRows.push(routedRow);
+        }
+      } catch (error) {
+        stillUnresolvedRows.push({
+          ...row,
+          targetCampaignGroup: targetGroup,
+          gptCandidates: candidates,
+          gptError: error.message,
+        });
+      }
+    }
+
+    unresolvedRows.splice(0, unresolvedRows.length, ...stillUnresolvedRows);
+  }
+
   await onProgress?.({
     stage: 'resolved',
     total: rows.length,
     resolvedRows,
     unresolvedRows,
+    ambiguousRows,
+    gptResolvedRows,
+    gptAttemptedRows,
   });
 
   return {
     resolvedRows,
     unresolvedRows,
-    ambiguousRows: [],
+    ambiguousRows,
+    gptResolvedRows,
+    gptAttemptedRows,
     campaignIds: numberList(resolvedRows.flatMap((row) => row.campaignIds)),
     campaignGroups: [...new Set(resolvedRows.map((row) => row.targetCampaignGroup).filter(Boolean))].sort(),
   };
@@ -470,10 +896,8 @@ export function parseFacebookSpendCsv(text, options = {}) {
   if (!rows.length) throw new Error('Не удалось извлечь ни одной строки расходов из CSV.');
 
   const dates = [...new Set(rows.map((row) => row.dateYmd))].sort();
-  const importId = `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
-
   return {
-    importId,
+    importId: createImportId(),
     importedAt: new Date().toISOString(),
     sourceRows,
     rows,
@@ -481,6 +905,90 @@ export function parseFacebookSpendCsv(text, options = {}) {
     currency,
     totalSpend: rows.reduce((sum, row) => sum + row.spend, 0),
     totalResults: rows.reduce((sum, row) => sum + row.results, 0),
+  };
+}
+
+function mergeSpendRow(current, row) {
+  current.spend += Number(row.spend || 0);
+  current.results += Number(row.results || 0);
+  current.impressions += Number(row.impressions || 0);
+  current.reach += Number(row.reach || 0);
+  current.sourceRows += Number(row.sourceRows || 0);
+
+  if (clean(row.endDateYmd).localeCompare(clean(current.endDateYmd)) > 0) {
+    current.endDateYmd = row.endDateYmd;
+  }
+
+  const sourceFiles = [
+    ...(Array.isArray(current.sourceFiles) ? current.sourceFiles : []),
+    ...(Array.isArray(row.sourceFiles) ? row.sourceFiles : []),
+  ].filter(Boolean);
+  if (sourceFiles.length) current.sourceFiles = [...new Set(sourceFiles)];
+}
+
+export function combineFacebookSpendImports(importBatches, options = {}) {
+  const batches = (Array.isArray(importBatches) ? importBatches : [])
+    .filter((batch) => batch?.rows?.length);
+  if (!batches.length) {
+    throw new Error('No Facebook spend CSV imports to combine.');
+  }
+  if (batches.length === 1 && !options.force) {
+    return batches[0];
+  }
+
+  const grouped = new Map();
+  let sourceRows = 0;
+
+  for (const batch of batches) {
+    sourceRows += Number(batch.sourceRows || 0);
+    for (const row of batch.rows) {
+      const currency = clean(row.currency || batch.currency || options.currency || 'USD').toUpperCase();
+      const key = [
+        clean(row.dateYmd),
+        clean(row.sub5),
+        currency,
+      ].join('|');
+      const current = grouped.get(key);
+      if (current) {
+        mergeSpendRow(current, row);
+        continue;
+      }
+
+      grouped.set(key, {
+        ...row,
+        currency,
+        spend: Number(row.spend || 0),
+        results: Number(row.results || 0),
+        impressions: Number(row.impressions || 0),
+        reach: Number(row.reach || 0),
+        sourceRows: Number(row.sourceRows || 0),
+        sourceFiles: Array.isArray(row.sourceFiles) ? [...row.sourceFiles] : [],
+      });
+    }
+  }
+
+  const rows = [...grouped.values()]
+    .map((row) => ({
+      ...row,
+      spend: Number(row.spend.toFixed(6)),
+      results: Number(row.results.toFixed(6)),
+      impressions: Number(row.impressions.toFixed(0)),
+      reach: Number(row.reach.toFixed(0)),
+    }))
+    .sort((a, b) => a.sub5.localeCompare(b.sub5, undefined, { numeric: true, sensitivity: 'base' }));
+  const currencies = [...new Set(rows.map((row) => clean(row.currency)).filter(Boolean))].sort();
+
+  return {
+    importId: createImportId(),
+    importedAt: new Date().toISOString(),
+    sourceRows,
+    rows,
+    dates: [...new Set(rows.map((row) => row.dateYmd).filter(Boolean))].sort(),
+    currency: currencies.length === 1 ? currencies[0] : (clean(options.currency).toUpperCase() || currencies[0] || 'USD'),
+    totalSpend: rows.reduce((sum, row) => sum + row.spend, 0),
+    totalResults: rows.reduce((sum, row) => sum + row.results, 0),
+    files: batches.flatMap((batch) => Array.isArray(batch.files) ? batch.files : []),
+    sourceImportIds: batches.map((batch) => batch.importId).filter(Boolean),
   };
 }
 
@@ -608,6 +1116,7 @@ export async function pushFacebookCostsToKeitaro({
   onlyCampaignUniques = true,
   campaignGroup = '',
   forceCampaignIds = false,
+  gptRouting = {},
   onProgress,
   windowStartHour = 0,
 }) {
@@ -652,6 +1161,8 @@ export async function pushFacebookCostsToKeitaro({
       campaignIds: numberList(campaignIds || []),
       unresolvedRows: [],
       ambiguousRows: [],
+      gptResolvedRows: [],
+      gptAttemptedRows: [],
       jobs: jobs.length,
       manual: true,
     };
@@ -664,6 +1175,7 @@ export async function pushFacebookCostsToKeitaro({
     timezone,
     fallbackCampaignIds: campaignIds,
     campaignGroup,
+    gptRouting,
     onProgress,
   });
 
@@ -706,6 +1218,8 @@ export async function pushFacebookCostsToKeitaro({
     campaignGroups: resolution.campaignGroups,
     unresolvedRows: resolution.unresolvedRows,
     ambiguousRows: resolution.ambiguousRows,
+    gptResolvedRows: resolution.gptResolvedRows,
+    gptAttemptedRows: resolution.gptAttemptedRows,
     jobs: jobs.length,
   };
 }

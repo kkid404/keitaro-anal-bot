@@ -38,6 +38,16 @@ const MONTHS = new Map([
   ['декабря', 12], ['декабрь', 12],
 ]);
 
+const WEEKDAYS = new Map([
+  ['воскресенье', 0], ['воскресенья', 0], ['вс', 0], ['sun', 0], ['sunday', 0],
+  ['понедельник', 1], ['понедельника', 1], ['пн', 1], ['mon', 1], ['monday', 1],
+  ['вторник', 2], ['вторника', 2], ['вт', 2], ['tue', 2], ['tuesday', 2],
+  ['среда', 3], ['среду', 3], ['среды', 3], ['ср', 3], ['wed', 3], ['wednesday', 3],
+  ['четверг', 4], ['четверга', 4], ['чт', 4], ['thu', 4], ['thursday', 4],
+  ['пятница', 5], ['пятницу', 5], ['пятницы', 5], ['пт', 5], ['fri', 5], ['friday', 5],
+  ['суббота', 6], ['субботу', 6], ['субботы', 6], ['сб', 6], ['sat', 6], ['saturday', 6],
+]);
+
 export class ApiError extends Error {
   constructor(message, details = {}) {
     super(message);
@@ -148,6 +158,39 @@ export function parseRelativeDate(input, now = new Date()) {
 
   if (source === 'yesterday' || source === 'вчера') {
     local.setDate(local.getDate() - 1);
+    return {
+      year: local.getFullYear(),
+      month: local.getMonth() + 1,
+      day: local.getDate(),
+    };
+  }
+
+  if (source === 'day_before_yesterday' || source === 'позавчера') {
+    local.setDate(local.getDate() - 2);
+    return {
+      year: local.getFullYear(),
+      month: local.getMonth() + 1,
+      day: local.getDate(),
+    };
+  }
+
+  const daysAgoMatch = source.match(/^(\d{1,3})\s*(?:d|days?|д|дн\.?|дня|дней|день)\s*(?:ago|назад)?$/i);
+  if (daysAgoMatch) {
+    local.setDate(local.getDate() - Number(daysAgoMatch[1]));
+    return {
+      year: local.getFullYear(),
+      month: local.getMonth() + 1,
+      day: local.getDate(),
+    };
+  }
+
+  const weekdayMatch = source.match(/^(?:last|прошл(?:ый|ая|ую|ое|ой))\s+(.+)$/i);
+  const weekdaySource = weekdayMatch ? clean(weekdayMatch[1]).toLowerCase() : source;
+  const weekday = WEEKDAYS.get(weekdaySource);
+  if (weekday !== undefined) {
+    let diff = (local.getDay() - weekday + 7) % 7;
+    if (weekdayMatch && diff === 0) diff = 7;
+    local.setDate(local.getDate() - diff);
     return {
       year: local.getFullYear(),
       month: local.getMonth() + 1,
@@ -308,6 +351,11 @@ function normalizeRow(row, columns, meta) {
   return Object.fromEntries(keys.map((key, index) => [key, row[index]]));
 }
 
+function normalizeApiRows(data, fallbackColumns = []) {
+  const meta = Array.isArray(data?.meta) ? data.meta : [];
+  return (data?.rows || []).map((row) => normalizeRow(row, fallbackColumns, meta));
+}
+
 function getStatus(row) {
   return clean(row.status || row.original_status).toLowerCase();
 }
@@ -330,6 +378,11 @@ function isRecoveredSale(row) {
 
 function conversionKey(row) {
   return clean(row.conversion_id || row.sub_id || `${row.sub_id_5}|${row.postback_datetime}|${row.sale_datetime}`);
+}
+
+function metricNumber(value) {
+  const amount = Number(String(value ?? 0).replace(',', '.').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(amount) ? amount : 0;
 }
 
 async function requestJson(endpoint, apiKey, payload) {
@@ -392,6 +445,86 @@ export async function fetchConversionLog({ baseUrl, apiKey, payload, label, limi
   return allRows;
 }
 
+async function fetchReportRows({ baseUrl, apiKey, payload }) {
+  const endpoint = `${normalizeBaseUrl(baseUrl)}/admin_api/v1/report/build`;
+  const data = await requestJson(endpoint, apiKey, payload);
+  return normalizeApiRows(data, [...(payload.dimensions || []), ...(payload.measures || [])]);
+}
+
+function installMetric(row) {
+  return metricNumber(row.campaign_unique_clicks);
+}
+
+function reportRange(timeWindow, timezone) {
+  if (timeWindow?.startDateTime && timeWindow?.endDateTime) {
+    return {
+      from: timeWindow.startDateTime,
+      to: timeWindow.endDateTime,
+      timezone,
+    };
+  }
+
+  return {
+    interval: 'all_time',
+    timezone,
+  };
+}
+
+function installDimensions(groupBy) {
+  if (groupBy === 'offer') return ['offer'];
+  return ['sub_id_5'];
+}
+
+async function fetchInstallRows(options, {
+  timeWindow = null,
+  timezone,
+  groupBy = 'sub5',
+  campaignGroup = '',
+  sub5 = '',
+  sub5Operator = 'EQUALS',
+} = {}) {
+  const dimensions = installDimensions(groupBy);
+  const filters = [];
+  const cleanSub5 = clean(sub5);
+  const cleanCampaignGroup = clean(campaignGroup);
+
+  if (cleanSub5) {
+    filters.push({ name: 'sub_id_5', operator: sub5Operator, expression: cleanSub5 });
+  }
+  if (cleanCampaignGroup) {
+    filters.push({ name: 'campaign_group', operator: 'EQUALS', expression: cleanCampaignGroup });
+  }
+
+  const payload = {
+    range: reportRange(timeWindow, timezone),
+    dimensions,
+    measures: ['campaign_unique_clicks'],
+    filters,
+    sort: [{ name: 'campaign_unique_clicks', order: 'DESC' }],
+  };
+
+  return fetchReportRows({
+    baseUrl: options.baseUrl,
+    apiKey: options.apiKey,
+    payload,
+  });
+}
+
+async function fetchInstallRowsWithFallback(options, request) {
+  const sub5 = clean(request?.sub5);
+  try {
+    return await fetchInstallRows(options, request);
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.details.status !== 406 || !sub5) throw error;
+
+    const rows = await fetchInstallRows(options, {
+      ...request,
+      sub5Operator: 'CONTAINS',
+    });
+    return rows.filter((row) => clean(row.sub_id_5) === sub5);
+  }
+}
+
 function addToGroup(grouped, sub5, field) {
   const key = clean(sub5);
   if (!key || isMacroValue(key)) return;
@@ -418,6 +551,10 @@ function groupField(groupBy) {
   return 'sub5';
 }
 
+function emptyReportRow(property, key) {
+  return { [property]: key, installs: 0, regs: 0, deps: 0, revenue: 0 };
+}
+
 function rowGroupValue(row, groupBy) {
   if (groupBy === 'offer') return clean(row.offer);
   if (groupBy === 'account') {
@@ -432,11 +569,23 @@ function addToReportGroup(grouped, row, field, groupBy) {
   const key = rowGroupValue(row, groupBy);
   if (!key || isMacroValue(key)) return;
   const property = groupField(groupBy);
-  const item = grouped.get(key) || { [property]: key, regs: 0, deps: 0, revenue: 0 };
+  const item = grouped.get(key) || emptyReportRow(property, key);
   item[field] += 1;
   if (field === 'deps') {
     item.revenue += moneyValue(row.revenue);
   }
+  grouped.set(key, item);
+}
+
+function addInstallsToReportGroup(grouped, row, groupBy) {
+  const installs = installMetric(row);
+  if (!installs) return;
+
+  const key = rowGroupValue(row, groupBy);
+  if (!key || isMacroValue(key)) return;
+  const property = groupField(groupBy);
+  const item = grouped.get(key) || emptyReportRow(property, key);
+  item.installs += installs;
   grouped.set(key, item);
 }
 
@@ -467,7 +616,8 @@ export function makeCsv(rows) {
     'количество рег(лид + продажа)',
     'депов(количество продаж)',
   ];
-  return [header, ...rows.map((row) => [row.sub5, row.regs, row.deps])]
+  header.splice(1, 0, 'Installs');
+  return [header, ...rows.map((row) => [row.sub5, row.installs || 0, row.regs, row.deps])]
     .map((row) => row.map((value) => escapeCsv(value)).join(CSV_SEPARATOR))
     .join('\r\n');
 }
@@ -508,8 +658,10 @@ export function makeAccountCsv(rows) {
     'Deps',
     'Revenue',
   ];
+  header.splice(1, 0, 'Installs');
   return [header, ...rows.map((row) => [
     row.accountId,
+    row.installs || 0,
     row.regs,
     row.deps,
     formatMoney(row.revenue),
@@ -684,25 +836,30 @@ export async function buildSub5Summary(config) {
   const inWindow = (value) => (
     targetDate ? isInDayWindow(value, targetDate, startHour) : true
   );
-
-  let rows = await fetchSub5RowsWithFallback({
+  const baseOptions = {
     baseUrl: normalizeBaseUrl(config.baseUrl || DEFAULT_BASE_URL),
     apiKey: config.apiKey,
     limit: config.limit || DEFAULT_LIMIT,
     verbose: config.verbose,
-  }, sub5, config.timezone || DEFAULT_TIMEZONE);
+  };
+
+  let rows = await fetchSub5RowsWithFallback(baseOptions, sub5, config.timezone || DEFAULT_TIMEZONE);
 
   let exactRows = rows.filter((row) => effectiveSub5(row) === sub5);
   if (!exactRows.length) {
-    const campaignRows = await fetchCampaignRowsWithFallback({
-      baseUrl: normalizeBaseUrl(config.baseUrl || DEFAULT_BASE_URL),
-      apiKey: config.apiKey,
-      limit: config.limit || DEFAULT_LIMIT,
-      verbose: config.verbose,
-    }, sub5, config.timezone || DEFAULT_TIMEZONE);
+    const campaignRows = await fetchCampaignRowsWithFallback(baseOptions, sub5, config.timezone || DEFAULT_TIMEZONE);
     rows = [...rows, ...campaignRows];
     exactRows = rows.filter((row) => effectiveSub5(row) === sub5);
   }
+  const installCampaignGroup = config.installCampaignGroup || config.campaignGroup || parseSub5(sub5).buyer;
+  const installRows = await fetchInstallRowsWithFallback(baseOptions, {
+    timeWindow,
+    timezone: config.timezone || DEFAULT_TIMEZONE,
+    groupBy: 'sub5',
+    campaignGroup: installCampaignGroup,
+    sub5,
+  });
+  const installs = installRows.reduce((sum, row) => sum + installMetric(row), 0);
   const scopedRows = targetDate
     ? exactRows.filter((row) => (
       inWindow(row.postback_datetime)
@@ -736,6 +893,15 @@ export async function buildSub5Summary(config) {
   const allTimeRegs = exactRows.filter((row) => isLeadOrSale(getStatus(row))).length;
   const allTimeNormalDeps = exactRows.filter((row) => isSale(getStatus(row))).length;
   const allTimeRecoveredDeps = exactRows.filter((row) => isRecoveredSale(row)).length;
+  const allTimeInstallRows = targetDate
+    ? await fetchInstallRowsWithFallback(baseOptions, {
+      timezone: config.timezone || DEFAULT_TIMEZONE,
+      groupBy: 'sub5',
+      campaignGroup: installCampaignGroup,
+      sub5,
+    })
+    : installRows;
+  const allTimeInstalls = allTimeInstallRows.reduce((sum, row) => sum + installMetric(row), 0);
 
   return {
     sub5,
@@ -744,12 +910,15 @@ export async function buildSub5Summary(config) {
     rows: scopedRows,
     allRows: exactRows,
     sourceRows: rows.length,
+    installSourceRows: installRows.length,
+    installs,
     regs: regRows.length,
     deps: allDepRows.length,
     normalDeps: depRows.length,
     recoveredDeps: uniqueRecoveredDepRows.length,
     lateDeps: lateDepRows.length,
     revenue,
+    allTimeInstalls,
     allTimeRegs,
     allTimeDeps: allTimeNormalDeps + allTimeRecoveredDeps,
     allTimeRecoveredDeps,
@@ -795,9 +964,9 @@ export async function buildReport(config) {
     },
     filters: [
       { name: 'status', operator: 'EQUALS', expression: 'sale' },
-      { name: 'sale_datetime', operator: 'BETWEEN', expression: [startDateTime, endDateTime] },
+      { name: 'postback_datetime', operator: 'BETWEEN', expression: [apiQueryStartDateTime, endDateTime] },
     ],
-    sort: [{ name: 'sale_datetime', order: 'ASC' }],
+    sort: [{ name: 'postback_datetime', order: 'ASC' }],
   });
 
   const recoveredSaleRows = await fetchRecoveredSalesWithFallback(baseOptions, {
@@ -811,6 +980,19 @@ export async function buildReport(config) {
     ],
     sort: [{ name: 'postback_datetime', order: 'ASC' }],
   });
+
+  const installRows = groupBy === 'offer'
+    ? []
+    : await fetchInstallRowsWithFallback(baseOptions, {
+      timeWindow,
+      timezone: config.timezone || DEFAULT_TIMEZONE,
+      groupBy,
+      campaignGroup: config.installCampaignGroup || config.campaignGroup,
+    });
+
+  for (const row of installRows) {
+    addInstallsToReportGroup(grouped, row, groupBy);
+  }
 
   for (const row of regRows) {
     const status = getStatus(row);
@@ -849,6 +1031,7 @@ export async function buildReport(config) {
 
   const regs = rows.reduce((sum, row) => sum + row.regs, 0);
   const deps = rows.reduce((sum, row) => sum + row.deps, 0);
+  const installs = rows.reduce((sum, row) => sum + Number(row.installs || 0), 0);
   const revenue = rows.reduce((sum, row) => sum + moneyValue(row.revenue), 0);
 
   return {
@@ -867,7 +1050,9 @@ export async function buildReport(config) {
       saleLoadedRows: saleRows.length,
       recoveredSaleSourceRows: sameDayRecoveredSaleRows.length,
       recoveredSaleLoadedRows: recoveredSaleRows.length,
+      installSourceRows: installRows.length,
       groups: rows.length,
+      installs,
       regs,
       deps,
       revenue,
@@ -911,6 +1096,7 @@ export function summarizeReport(report) {
       `${title} ${report.dateYmd}`,
       windowLabel,
       `Accounts: ${report.counts.groups}`,
+      `Installs: ${report.counts.installs || 0} (source rows: ${report.counts.installSourceRows || 0})`,
       `Regs: ${report.counts.regs} (source rows: ${report.counts.regSourceRows})`,
       `Deps: ${report.counts.deps} (source rows: ${report.counts.saleSourceRows})`,
       `Revenue: ${formatMoney(report.counts.revenue)}`,
@@ -923,6 +1109,7 @@ export function summarizeReport(report) {
     `${title} ${report.dateYmd}`,
     windowLabel,
     `Groups: ${report.counts.groups}`,
+    `Installs: ${report.counts.installs || 0} (source rows: ${report.counts.installSourceRows || 0})`,
     `Regs: ${report.counts.regs} (source rows: ${report.counts.regSourceRows})`,
     `Deps: ${report.counts.deps} (source rows: ${report.counts.saleSourceRows})`,
     `Revenue: ${formatMoney(report.counts.revenue)}`,
